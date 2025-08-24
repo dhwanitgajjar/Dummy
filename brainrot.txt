@@ -1,0 +1,8 @@
+import os
+
+for p in [
+    "I:\\bitbucket\\NDA_ARG_20_08_2025\\NDA ARG\\data\\Redacted NDAs for Testing\\Redacted NDA 5.docx",
+    "I:\\bitbucket\\NDA_ARG_20_08_2025\\NDA ARG\\output\\Redacted NDAs for Testing\\Redacted_NDA_5_cleaned_rewritten_nda_v1.docx",
+    "./../data/CompareDocsMacro.docm"
+]:
+    print(p, "->", os.path.exists(p))
