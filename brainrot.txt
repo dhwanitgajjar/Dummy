@@ -1,8 +1,305 @@
+from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import os
+import sys
+import shutil
+import uuid
+from typing import List
+import pandas as pd
+from bs4 import BeautifulSoup
 
-for p in [
-    "I:\\bitbucket\\NDA_ARG_20_08_2025\\NDA ARG\\data\\Redacted NDAs for Testing\\Redacted NDA 5.docx",
-    "I:\\bitbucket\\NDA_ARG_20_08_2025\\NDA ARG\\output\\Redacted NDAs for Testing\\Redacted_NDA_5_cleaned_rewritten_nda_v1.docx",
-    "./../data/CompareDocsMacro.docm"
-]:
-    print(p, "->", os.path.exists(p))
+# Add your base directory to the path (adjust as needed)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# Import your existing modules
+from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, 
+                           SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
+from base.llm_helper import LLMHelper
+from base.file_processing import convert_and_extract_text, analyze_document_fonts
+from base.break_documents_into_parts import break_the_document_into_parts, get_nda_sections_list
+from base.get_nda_analysis import get_nda_review_and_amendments
+from base.processing_amendments import process_amendments
+from base.deduplication_of_amendments import (deduplication_of_amendments, 
+                                            deduplicate_amendments_reports, 
+                                            update_sections_list)
+from base.save_to_excel import save_to_excel_with_multiple_sheets
+from base.utils import preprocess_filename, html_to_clean_docx
+from base.rewrite_nda_section import process_nda_sections
+
+# Create FastAPI app
+app = FastAPI(title="NDA Processing Application")
+
+# Mount static files (for CSS, JS, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Setup templates
+templates = Jinja2Templates(directory="templates")
+
+# Ensure directories exist
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+
+# In-memory storage for processing status (in production, use Redis or database)
+processing_status = {}
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    """Serve the main HTML page"""
+    # You would put your HTML content here or use templates
+    # For now, we'll serve a simple HTML response
+    html_content = """<!DOCTYPE html>
+    <html>
+    <head>
+        <title>NDA Processing with LLM</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; background-color: #f0f0f0; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }
+            .upload-section { margin: 20px 0; }
+            .file-input { margin: 10px 0; }
+            .btn { background: #0066cc; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+            .btn:hover { background: #0052a3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>NDA Processing with LLM</h1>
+            <p>Upload your Policy and NDA documents to generate a revised NDA.</p>
+
+            <form action="/process" method="post" enctype="multipart/form-data" class="upload-section">
+                <div class="file-input">
+                    <label for="policy_file">Policy Document:</label>
+                    <input type="file" name="policy_file" accept=".doc,.docx,.pdf" required>
+                </div>
+
+                <div class="file-input">
+                    <label for="nda_file">NDA Document:</label>
+                    <input type="file" name="nda_file" accept=".doc,.docx,.pdf" required>
+                </div>
+
+                <button type="submit" class="btn">Process Documents</button>
+            </form>
+        </div>
+    </body>
+    </html>"""
+    return HTMLResponse(content=html_content)
+
+@app.post("/process")
+async def process_documents(
+    background_tasks: BackgroundTasks,
+    policy_file: UploadFile = File(...),
+    nda_file: UploadFile = File(...)
+):
+    """Handle document processing"""
+
+    # Validate file types
+    allowed_extensions = {'.doc', '.docx', '.pdf'}
+
+    def get_file_extension(filename: str) -> str:
+        return os.path.splitext(filename)[1].lower()
+
+    if get_file_extension(policy_file.filename) not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Policy file must be .doc, .docx, or .pdf")
+
+    if get_file_extension(nda_file.filename) not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="NDA file must be .doc, .docx, or .pdf")
+
+    # Generate unique task ID
+    task_id = str(uuid.uuid4())
+    processing_status[task_id] = {"status": "processing", "progress": 0}
+
+    # Save uploaded files
+    policy_path = os.path.join(INPUT_DIR, policy_file.filename)
+    nda_path = os.path.join(INPUT_DIR, nda_file.filename)
+
+    with open(policy_path, "wb") as buffer:
+        shutil.copyfileobj(policy_file.file, buffer)
+
+    with open(nda_path, "wb") as buffer:
+        shutil.copyfileobj(nda_file.file, buffer)
+
+    # Start background processing
+    background_tasks.add_task(
+        run_processing_workflow, 
+        task_id, 
+        policy_path, 
+        nda_path
+    )
+
+    # Return processing status
+    return {
+        "message": "Processing started successfully", 
+        "task_id": task_id,
+        "status_url": f"/status/{task_id}"
+    }
+
+def run_processing_workflow(task_id: str, policy_file_path: str, nda_file_path: str):
+    """
+    Background task to run the document processing workflow
+    This is where your existing Streamlit logic goes
+    """
+    try:
+        # Update status
+        processing_status[task_id]["status"] = "extracting_text"
+        processing_status[task_id]["progress"] = 10
+
+        # Initialize LLM helper
+        llm_helper = LLMHelper(GPT_MODEL)
+        multiplier = MULTIPLIER
+
+        # Extract the policy text
+        processing_status[task_id]["progress"] = 20
+        policy_returned_filename, policy_text = convert_and_extract_text(
+            INPUT_DIR, os.path.basename(policy_file_path)
+        )
+
+        # Extract the NDA text
+        processing_status[task_id]["progress"] = 30
+        nda_returned_filename, nda_text = convert_and_extract_text(
+            INPUT_DIR, os.path.basename(nda_file_path)
+        )
+
+        # Break the document into parts
+        processing_status[task_id]["progress"] = 40
+        structured_parts = break_the_document_into_parts(nda_text, nda_returned_filename)
+        nda_sections_list = get_nda_sections_list(structured_parts)
+
+        # Generate amendments report
+        processing_status[task_id]["progress"] = 50
+        list_of_amendments = get_nda_review_and_amendments(
+            policy_text, nda_text, nda_sections_list, llm_helper
+        )
+
+        processing_status[task_id]["progress"] = 60
+        amendments_report = process_amendments(list_of_amendments)
+
+        processing_status[task_id]["progress"] = 70
+        dedup_analysis, id_to_amendment = deduplication_of_amendments(amendments_report, llm_helper)
+        dedup_amendments_report = deduplicate_amendments_reports(dedup_analysis, id_to_amendment)
+        updated_list = update_sections_list(nda_sections_list, dedup_amendments_report)
+
+        # Save reports to excel
+        processing_status[task_id]["progress"] = 80
+        preprocessed_filename = preprocess_filename(os.path.basename(nda_file_path))
+        reports_filename = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_amendments_report.xlsx")
+
+        data_dict = {
+            "Amendments Report": pd.DataFrame(amendments_report),
+            "DeDuplication Analysis": pd.DataFrame(dedup_analysis),
+            "Dedup Amendments Report": pd.DataFrame(dedup_amendments_report),
+            "NDA Sections": pd.DataFrame(nda_sections_list),
+        }
+        save_to_excel_with_multiple_sheets(data_dict, reports_filename)
+
+        # Process NDA sections and rewrite
+        processing_status[task_id]["progress"] = 90
+        result = process_nda_sections(updated_list, nda_sections_list, dedup_amendments_report, llm_helper, multiplier)
+        rewritten_nda_sections_text = " ".join(result)
+
+        # Generate and save outputs
+        html_path, docx_path, html_no_rationale_path = generate_and_save_outputs(
+            rewritten_nda_sections_text, os.path.basename(nda_file_path)
+        )
+
+        # Update final status
+        processing_status[task_id] = {
+            "status": "completed",
+            "progress": 100,
+            "files": {
+                "excel_report": reports_filename,
+                "html_with_revisions": html_path,
+                "docx_file": docx_path,
+                "html_no_rationale": html_no_rationale_path
+            },
+            "preview_content": rewritten_nda_sections_text
+        }
+
+    except Exception as e:
+        processing_status[task_id] = {
+            "status": "error",
+            "progress": 0,
+            "error": str(e)
+        }
+
+def generate_and_save_outputs(rewritten_nda_sections_text: str, nda_filename: str):
+    """Generate and save the HTML and DOCX outputs."""
+    preprocessed_filename = preprocess_filename(nda_filename)
+
+    # Generate HTML version
+    rewritten_nda_html_filename = os.path.join(
+        OUTPUT_DIR, 
+        preprocessed_filename + f"_rewritten_nda_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.html"
+    )
+    with open(rewritten_nda_html_filename, "w", encoding="utf-8") as f:
+        f.write(rewritten_nda_sections_text)
+
+    # Generate HTML version without rationale
+    soup = BeautifulSoup(rewritten_nda_sections_text, 'html.parser')
+    for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        if tag.text.strip() in ['HEADER', 'FOOTER']:
+            tag.decompose()
+    if not CLAUSES_PRESENT:
+        for tag in soup.find_all('h2'):
+            tag.decompose()
+    for span in soup.find_all('span', style=True):
+        if 'background-color:yellow' in span['style'].replace(' ', '').lower():
+            span.decompose()
+    for p in soup.find_all('p', style=True):
+        if 'background-color:yellow' in p['style'].replace(' ', '').lower():
+            p.decompose()
+
+    rewritten_nda_html_no_rationale_filename = os.path.join(
+        OUTPUT_DIR, 
+        preprocessed_filename + f"_rewritten_nda_with_no_rationale_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.html"
+    )
+    with open(rewritten_nda_html_no_rationale_filename, 'w', encoding='utf-8') as f:
+        f.write(str(soup))
+
+    # Generate DOCX version
+    FONT_NAME = analyze_document_fonts(INPUT_DIR, nda_filename)
+    rewritten_nda_docx_filename = os.path.join(
+        OUTPUT_DIR, 
+        preprocessed_filename + f"_cleaned_rewritten_nda_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.docx"
+    )
+    html_to_clean_docx(str(soup), rewritten_nda_docx_filename, FONT_NAME)
+
+    return rewritten_nda_html_filename, rewritten_nda_docx_filename, rewritten_nda_html_no_rationale_filename
+
+@app.get("/status/{task_id}")
+async def get_processing_status(task_id: str):
+    """Get the processing status of a task"""
+    if task_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return processing_status[task_id]
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    """Download processed files"""
+    file_path = os.path.join(OUTPUT_DIR, filename)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Determine media type based on file extension
+    if filename.endswith('.xlsx'):
+        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    elif filename.endswith('.docx'):
+        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    elif filename.endswith('.html'):
+        media_type = 'text/html'
+    else:
+        media_type = 'application/octet-stream'
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type=media_type
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
