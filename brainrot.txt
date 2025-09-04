@@ -1,432 +1,429 @@
-# Backend Modifications for Enhanced NDA Processing
-from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+# Modified ui.py - Add checkbox functionality to existing functions
+import streamlit as st
 import os
 import sys
-import shutil
-import uuid
-from typing import List, Dict
-import pandas as pd
-from bs4 import BeautifulSoup
-import json
+import requests
+import time
 
-# Add your base directory to the path (adjust as needed)
+# Configuration for FastAPI backend
+FASTAPI_BASE_URL = "http://localhost:8000" # Adjust this to your FastAPI server URL
+
+# Adjust the path to import from the 'base' directory correctly (if needed for constants)
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-# Import your existing modules
-from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
-from base.llm_helper import LLMHelper
-from base.file_processing import convert_and_extract_text, analyze_document_fonts
-from base.break_documents_into_parts import break_the_document_into_parts, get_nda_sections_list
-from base.get_nda_analysis import get_nda_review_and_amendments
-from base.processing_amendments import process_amendments
-from base.deduplication_of_amendments import (deduplication_of_amendments, deduplicate_amendments_reports, update_sections_list)
-from base.save_to_excel import save_to_excel_with_multiple_sheets
-from base.utils import preprocess_filename, html_to_clean_docx
-from base.rewrite_nda_section import process_nda_sections
+# Import only constants if needed for display purposes
+try:
+    from base.constants import (INPUT_DIR, OUTPUT_DIR)
+except ImportError:
+    # Fallback values if constants not available
+    INPUT_DIR = "input"
+    OUTPUT_DIR = "output"
 
-# Create FastAPI app
-app = FastAPI(title="Enhanced NDA Processing Application with Selection")
-
-# Mount static files (for CSS, JS, etc.)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Setup templates
-templates = Jinja2Templates(directory="templates")
-
-# Ensure directories exist
+# Ensure directories exist (for local file handling if needed)
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs("static", exist_ok=True)
-os.makedirs("templates", exist_ok=True)
 
-# In-memory storage for processing status and suggestions (in production, use Redis or database)
-processing_status = {}
-ai_suggestions_storage = {}
+# Add session state initialization at the top of the file
+if 'ai_suggestions' not in st.session_state:
+    st.session_state.ai_suggestions = []
+if 'selected_suggestions' not in st.session_state:
+    st.session_state.selected_suggestions = {}
+if 'current_task_id' not in st.session_state:
+    st.session_state.current_task_id = None
 
-class AIsuggestion:
-    """Class to represent an AI suggestion"""
-    def __init__(self, section, original_text, suggested_text, rationale, confidence=0.5):
-        self.section = section
-        self.original_text = original_text
-        self.suggested_text = suggested_text
-        self.rationale = rationale
-        self.confidence = confidence
-    
-    def to_dict(self):
-        return {
-            'section': self.section,
-            'original_text': self.original_text,
-            'suggested_text': self.suggested_text,
-            'rationale': self.rationale,
-            'confidence': self.confidence
-        }
+# Function to save uploaded file (kept for compatibility)
+def save_uploaded_file(uploaded_file, directory):
+    """Saves an uploaded file to a specified directory."""
+    if uploaded_file is not None:
+        file_path = os.path.join(directory, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return file_path
+    return None
 
-def extract_suggestions_from_processing_result(amendments_data, nda_sections):
-    """
-    Extract structured AI suggestions from your processing results.
-    This function should be customized based on your actual data structure.
-    """
-    suggestions = []
-    suggestion_id = 1
-    
-    # Example extraction - adapt this to your actual data structure
-    if isinstance(amendments_data, list):
-        for amendment in amendments_data:
-            # Extract relevant information from each amendment
-            section_name = amendment.get('section', f'Section {suggestion_id}')
-            original = amendment.get('original_text', '')
-            suggested = amendment.get('revised_text', amendment.get('suggested_text', ''))
-            reason = amendment.get('rationale', amendment.get('reason', 'AI-generated improvement'))
-            confidence = amendment.get('confidence', 0.75)
-            
-            if suggested and suggested != original:
-                suggestion = AIsuggestion(
-                    section=section_name,
-                    original_text=original,
-                    suggested_text=suggested,
-                    rationale=reason,
-                    confidence=confidence
-                )
-                suggestions.append(suggestion)
-                suggestion_id += 1
-    
-    elif isinstance(amendments_data, dict):
-        # Handle dictionary format
-        for section_key, section_data in amendments_data.items():
-            if isinstance(section_data, dict):
-                original = section_data.get('original', '')
-                suggested = section_data.get('revised', section_data.get('suggested', ''))
-                reason = section_data.get('rationale', 'AI-generated improvement')
-                confidence = section_data.get('confidence', 0.75)
-                
-                if suggested and suggested != original:
-                    suggestion = AIsuggestion(
-                        section=section_key,
-                        original_text=original,
-                        suggested_text=suggested,
-                        rationale=reason,
-                        confidence=confidence
-                    )
-                    suggestions.append(suggestion)
-    
-    return suggestions
-
-def process_documents_with_suggestions(policy_file_path, nda_file_path, task_id):
-    """
-    Enhanced version of your processing workflow that extracts suggestions.
-    This replaces your existing run_processing_workflow function.
-    """
+def upload_files_to_fastapi(policy_file, nda_file):
+    """Upload files to FastAPI backend and start processing"""
     try:
-        # Update status
-        processing_status[task_id]['status'] = 'processing'
-        processing_status[task_id]['progress'] = 10
-        
-        # Initialize LLM helper
-        llm_helper = LLMHelper()
-        
-        # Convert and extract text from documents
-        processing_status[task_id]['progress'] = 20
-        policy_text = convert_and_extract_text(policy_file_path)
-        nda_text = convert_and_extract_text(nda_file_path)
-        
-        # Break documents into parts
-        processing_status[task_id]['progress'] = 30
-        policy_sections = break_the_document_into_parts(policy_text, "policy")
-        nda_sections_list = get_nda_sections_list(nda_text)
-        
-        # Get NDA analysis and amendments
-        processing_status[task_id]['progress'] = 50
-        amendments_data = get_nda_review_and_amendments(
-            policy_sections, nda_sections_list, llm_helper
-        )
-        
-        # Process amendments
-        processing_status[task_id]['progress'] = 70
-        processed_amendments = process_amendments(amendments_data)
-        
-        # Extract AI suggestions from processing results
-        ai_suggestions = extract_suggestions_from_processing_result(
-            processed_amendments, nda_sections_list
-        )
-        
-        # Store suggestions for this task
-        ai_suggestions_storage[task_id] = [s.to_dict() for s in ai_suggestions]
-        
-        # Add unique IDs to suggestions
-        for i, suggestion in enumerate(ai_suggestions_storage[task_id]):
-            suggestion['id'] = i + 1
-        
-        # Continue with deduplication and final processing
-        processing_status[task_id]['progress'] = 80
-        deduplicated_amendments = deduplication_of_amendments(processed_amendments)
-        
-        # Generate initial outputs (these will be refined based on user selection)
-        processing_status[task_id]['progress'] = 90
-        nda_filename = os.path.basename(nda_file_path)
-        preprocessed_filename = preprocess_filename(nda_filename)
-        
-        # Save initial results
-        excel_report_path, html_with_revisions, docx_file = generate_and_save_outputs(
-            deduplicated_amendments, preprocessed_filename
-        )
-        
-        # Update status to completed
-        processing_status[task_id]['status'] = 'completed'
-        processing_status[task_id]['progress'] = 100
-        processing_status[task_id]['files'] = {
-            'excel_report': excel_report_path,
-            'html_with_revisions': html_with_revisions,
-            'docx_file': docx_file
+        # Prepare files for upload
+        files = {
+            'policy_file': (policy_file.name, policy_file.getvalue(), policy_file.type),
+            'nda_file': (nda_file.name, nda_file.getvalue(), nda_file.type)
         }
-        processing_status[task_id]['suggestions'] = ai_suggestions_storage[task_id]
-        processing_status[task_id]['preprocessed_filename'] = preprocessed_filename
         
-        return True
-        
+        # Make API call to start processing
+        response = requests.post(f"{FASTAPI_BASE_URL}/process", files=files)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Upload failed: {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot connect to FastAPI server. Make sure it's running on port 8000.")
+        return None
     except Exception as e:
-        processing_status[task_id]['status'] = 'error'
-        processing_status[task_id]['error'] = str(e)
-        return False
+        st.error(f"Error uploading files: {str(e)}")
+        return None
 
-def generate_and_save_outputs(amendments_data, preprocessed_filename):
-    """
-    Generate and save output files.
-    This is your existing function, possibly with modifications.
-    """
-    # Your existing implementation here
-    # Return paths to generated files
-    excel_report_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_report.xlsx")
-    html_with_revisions = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.html")
-    docx_file = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.docx")
-    
-    # Your existing file generation logic here...
-    
-    return excel_report_path, html_with_revisions, docx_file
+def monitor_processing_status(task_id):
+    """Monitor processing status and return results when complete - MODIFIED to handle suggestions"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    max_attempts = 120 # 10 minutes with 5-second intervals
+    attempt = 0
 
-def process_selected_suggestions_backend(task_id, selected_suggestion_ids):
-    """
-    Process only the selected suggestions to generate final document.
-    """
+    while attempt < max_attempts:
+        try:
+            response = requests.get(f"{FASTAPI_BASE_URL}/status/{task_id}")
+            if response.status_code == 200:
+                status_data = response.json()
+                status = status_data.get('status', 'unknown')
+                progress = status_data.get('progress', 0)
+
+                # Update progress bar and status
+                progress_bar.progress(progress / 100.0)
+                status_text.text(f"Status: {status} | Progress: {progress}%")
+
+                if status == 'completed':
+                    progress_bar.progress(1.0)
+                    status_text.success("Processing completed successfully!")
+                    
+                    # MODIFIED: Extract and store suggestions if available
+                    suggestions = status_data.get('suggestions', [])
+                    if suggestions:
+                        st.session_state.ai_suggestions = suggestions
+                        st.session_state.current_task_id = task_id
+                        # Initialize all suggestions as selected by default
+                        st.session_state.selected_suggestions = {
+                            suggestion['id']: True for suggestion in suggestions
+                        }
+                    
+                    return status_data
+                elif status == 'error':
+                    error_msg = status_data.get('error', 'Unknown error')
+                    status_text.error(f"Processing failed: {error_msg}")
+                    return None
+                else:
+                    # Still processing, wait and check again
+                    time.sleep(5)
+                    attempt += 1
+            else:
+                status_text.error(f"Status check failed: {response.status_code}")
+                return None
+        except Exception as e:
+            status_text.error(f"Error checking status: {str(e)}")
+            return None
+
+    status_text.error("Processing timeout - took too long (10+ minutes)")
+    return None
+
+def download_file_from_fastapi(filename):
+    """Download a file from FastAPI backend"""
     try:
-        if task_id not in ai_suggestions_storage:
-            raise ValueError("No suggestions found for this task")
-        
-        all_suggestions = ai_suggestions_storage[task_id]
-        selected_suggestions = [
-            s for s in all_suggestions 
-            if s['id'] in selected_suggestion_ids
+        response = requests.get(f"{FASTAPI_BASE_URL}/download/{filename}")
+        if response.status_code == 200:
+            return response.content
+        else:
+            st.error(f"Download failed for {filename}: {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Error downloading {filename}: {str(e)}")
+        return None
+
+def run_processing_workflow(policy_file_path, nda_file_path, multiplier, llm_helper):
+    """
+    This method is kept for compatibility but now delegates to FastAPI backend
+    In the new architecture, this logic runs on the FastAPI backend
+    """
+    st.info("This method now runs on the FastAPI backend")
+    return None, None
+
+def generate_and_save_outputs(rewritten_nda_sections_text, nda_filename):
+    """
+    This method is kept for compatibility but now handled by FastAPI backend
+    In the new architecture, this logic runs on the FastAPI backend
+    MODIFIED: Now also handles selective generation based on checkbox selections
+    """
+    # If we have selections, process them selectively
+    if st.session_state.selected_suggestions and st.session_state.current_task_id:
+        selected_ids = [
+            suggestion_id for suggestion_id, is_selected 
+            in st.session_state.selected_suggestions.items() 
+            if is_selected
         ]
         
-        if not selected_suggestions:
-            raise ValueError("No valid suggestions selected")
-        
-        # Get the preprocessed filename from the original processing
-        preprocessed_filename = processing_status[task_id]['preprocessed_filename']
-        
-        # Generate new outputs with only selected suggestions
-        # You'll need to implement this based on your specific requirements
-        final_excel_path, final_html_path, final_docx_path = generate_selective_outputs(
-            selected_suggestions, preprocessed_filename
-        )
-        
-        return {
-            'status': 'success',
-            'files': {
-                'excel_report': final_excel_path,
-                'html_with_revisions': final_html_path,
-                'docx_file': final_docx_path
-            },
-            'selected_count': len(selected_suggestions),
-            'total_count': len(all_suggestions)
-        }
-        
-    except Exception as e:
-        return {
-            'status': 'error',
-            'error': str(e)
-        }
+        if selected_ids:
+            try:
+                # Send selected suggestions to backend for processing
+                selection_data = {
+                    'task_id': st.session_state.current_task_id,
+                    'selected_suggestion_ids': selected_ids
+                }
+                
+                response = requests.post(f"{FASTAPI_BASE_URL}/process_selections", json=selection_data)
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get('files', {}), None, None
+                else:
+                    st.error(f"Selection processing failed: {response.status_code}")
+                    return None, None, None
+            except Exception as e:
+                st.error(f"Error processing selections: {str(e)}")
+                return None, None, None
+    
+    st.info("This method now runs on the FastAPI backend")
+    return None, None, None
 
-def generate_selective_outputs(selected_suggestions, preprocessed_filename):
-    """
-    Generate outputs with only the selected suggestions.
-    You'll need to implement this based on your specific file generation logic.
-    """
-    # Create new filenames for selective processing
-    excel_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_report.xlsx")
-    html_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_revised.html")
-    docx_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_revised.docx")
+# NEW HELPER FUNCTION: Display suggestions with checkboxes (added to existing structure)
+def display_suggestions_interface():
+    """Display AI suggestions with checkbox selection interface"""
+    if not st.session_state.ai_suggestions:
+        return False
     
-    # Implement your file generation logic here
-    # This should create documents with only the selected suggestions
+    st.markdown("---")
+    st.subheader("🤖 AI Suggestions - Review and Select")
+    st.markdown("Review each suggestion and choose which ones to include in your final document.")
     
-    # Example implementation (you'll need to adapt this):
-    # 1. Filter your original amendments data to include only selected items
-    # 2. Regenerate the HTML/DOCX with only those amendments
-    # 3. Update the Excel report to show only selected suggestions
+    # Control buttons
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("✅ Select All", key="select_all_suggestions"):
+            for suggestion in st.session_state.ai_suggestions:
+                st.session_state.selected_suggestions[suggestion['id']] = True
+            st.experimental_rerun()
     
-    return excel_path, html_path, docx_path
+    with col2:
+        if st.button("❌ Deselect All", key="deselect_all_suggestions"):
+            for suggestion in st.session_state.ai_suggestions:
+                st.session_state.selected_suggestions[suggestion['id']] = False
+            st.experimental_rerun()
+    
+    with col3:
+        selected_count = sum(1 for selected in st.session_state.selected_suggestions.values() if selected)
+        total_count = len(st.session_state.ai_suggestions)
+        st.info(f"📊 Selected: {selected_count} / {total_count} suggestions")
+    
+    st.markdown("---")
+    
+    # Display each suggestion
+    for suggestion in st.session_state.ai_suggestions:
+        suggestion_id = suggestion['id']
+        
+        with st.expander(f"📝 {suggestion.get('section', f'Suggestion {suggestion_id}')}", expanded=False):
+            # Checkbox for this suggestion
+            current_selection = st.session_state.selected_suggestions.get(suggestion_id, True)
+            is_selected = st.checkbox(
+                "Include this suggestion in final document",
+                value=current_selection,
+                key=f"suggestion_checkbox_{suggestion_id}"
+            )
+            
+            # Update session state
+            st.session_state.selected_suggestions[suggestion_id] = is_selected
+            
+            # Display suggestion details in columns
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.markdown("**📄 Original Text:**")
+                st.text_area(
+                    "Original",
+                    value=suggestion.get('original_text', 'N/A'),
+                    height=120,
+                    disabled=True,
+                    key=f"original_text_{suggestion_id}",
+                    label_visibility="collapsed"
+                )
+            
+            with col2:
+                st.markdown("**✨ Suggested Text:**")
+                st.text_area(
+                    "Suggested",
+                    value=suggestion.get('suggested_text', 'N/A'),
+                    height=120,
+                    disabled=True,
+                    key=f"suggested_text_{suggestion_id}",
+                    label_visibility="collapsed"
+                )
+            
+            # Rationale
+            st.markdown("**💡 Rationale:**")
+            st.write(suggestion.get('rationale', 'No rationale provided'))
+            
+            # Confidence score if available
+            if 'confidence' in suggestion:
+                confidence = float(suggestion['confidence'])
+                st.progress(confidence, text=f"AI Confidence: {confidence:.1%}")
+            
+            # Selection status indicator
+            if is_selected:
+                st.success("✅ This suggestion will be included in the final document")
+            else:
+                st.warning("❌ This suggestion will be excluded from the final document")
+    
+    return True
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    """Serve the main HTML page"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Enhanced NDA Processing API</title>
-    </head>
-    <body>
-        <h1>Enhanced NDA Processing Application</h1>
-        <p>Upload your Policy and NDA documents to generate AI suggestions with selection capability.</p>
-        <h2>Available Endpoints:</h2>
-        <ul>
-            <li><strong>POST /process</strong> - Upload documents and start processing</li>
-            <li><strong>GET /status/{task_id}</strong> - Check processing status</li>
-            <li><strong>POST /process_selections</strong> - Process selected suggestions</li>
-            <li><strong>GET /download/{filename}</strong> - Download generated files</li>
-        </ul>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+# --- Streamlit UI ---
+st.set_page_config(page_title="Enhanced NDA Processing App", layout="wide")
 
-@app.post("/process")
-async def process_files(
-    background_tasks: BackgroundTasks,
-    policy_file: UploadFile = File(...),
-    nda_file: UploadFile = File(...)
-):
-    """Enhanced processing endpoint that generates AI suggestions"""
-    
-    # Generate unique task ID
-    task_id = str(uuid.uuid4())
-    
-    # Initialize processing status
-    processing_status[task_id] = {
-        'status': 'started',
-        'progress': 0,
-        'task_id': task_id
-    }
-    
-    try:
-        # Save uploaded files
-        policy_path = os.path.join(INPUT_DIR, f"{task_id}_policy_{policy_file.filename}")
-        nda_path = os.path.join(INPUT_DIR, f"{task_id}_nda_{nda_file.filename}")
-        
-        with open(policy_path, "wb") as buffer:
-            shutil.copyfileobj(policy_file.file, buffer)
-        
-        with open(nda_path, "wb") as buffer:
-            shutil.copyfileobj(nda_file.file, buffer)
-        
-        # Start background processing
-        background_tasks.add_task(
-            process_documents_with_suggestions,
-            policy_path,
-            nda_path,
-            task_id
-        )
-        
-        return {"task_id": task_id, "status": "started"}
-        
-    except Exception as e:
-        processing_status[task_id]['status'] = 'error'
-        processing_status[task_id]['error'] = str(e)
-        raise HTTPException(status_code=500, detail=str(e))
+custom_css = """
+<style>
+.suggestion-selected {
+    background-color: #e8f5e8;
+    border-left: 4px solid #2ca02c;
+    padding: 10px;
+    border-radius: 5px;
+    margin: 5px 0;
+}
+.suggestion-deselected {
+    background-color: #fdf2f2;
+    border-left: 4px solid #d62728;
+    padding: 10px;
+    border-radius: 5px;
+    margin: 5px 0;
+}
+</style>
+"""
 
-@app.get("/status/{task_id}")
-async def get_status(task_id: str):
-    """Get processing status with suggestions"""
-    if task_id not in processing_status:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    status_data = processing_status[task_id].copy()
-    
-    # Include suggestions in the response when processing is complete
-    if status_data['status'] == 'completed' and task_id in ai_suggestions_storage:
-        status_data['suggestions'] = ai_suggestions_storage[task_id]
-    
-    return status_data
+# Inject the custom CSS into the Streamlit app
+st.markdown(custom_css, unsafe_allow_html=True)
 
-@app.post("/process_selections")
-async def process_selections(selection_data: dict):
-    """New endpoint to process user's suggestion selections"""
-    
-    try:
-        task_id = selection_data.get('task_id')
-        selected_suggestion_ids = selection_data.get('selected_suggestion_ids', [])
-        
-        if not task_id:
-            raise HTTPException(status_code=400, detail="task_id is required")
-        
-        if task_id not in processing_status:
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        if processing_status[task_id]['status'] != 'completed':
-            raise HTTPException(status_code=400, detail="Original processing not completed")
-        
-        # Process selected suggestions
-        result = process_selected_suggestions_backend(task_id, selected_suggestion_ids)
-        
-        if result['status'] == 'error':
-            raise HTTPException(status_code=500, detail=result['error'])
-        
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+st.title("Enhanced NDA Processing with AI Suggestion Selection")
+st.markdown("Upload your Policy and NDA documents to generate AI suggestions, then choose which ones to keep.")
 
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """Download generated files"""
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Determine media type based on file extension
-    if filename.endswith('.html'):
-        media_type = 'text/html'
-    elif filename.endswith('.docx'):
-        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif filename.endswith('.xlsx'):
-        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+# Display FastAPI connection status
+try:
+    response = requests.get(f"{FASTAPI_BASE_URL}/", timeout=5)
+    if response.status_code == 200:
+        st.success("✅ Connected to FastAPI backend")
     else:
-        media_type = 'application/octet-stream'
+        st.warning(f"⚠️ FastAPI backend responded with status: {response.status_code}")
+except:
+    st.error("❌ Cannot connect to FastAPI backend. Make sure it's running on port 8000.")
+    st.info("Run: `uvicorn endpoint:app --reload` to start the FastAPI server")
+
+# File uploaders
+col1, col2 = st.columns(2)
+
+with col1:
+    uploaded_policy = st.file_uploader("Upload Policy Document", type=["doc", "docx", "pdf"])
+
+with col2:
+    uploaded_nda = st.file_uploader("Upload NDA Document", type=["doc", "docx", "pdf"])
+
+# Processing button
+if st.button("🚀 Process Documents and Get AI Suggestions", type="primary"):
+    if uploaded_policy and uploaded_nda:
+        st.info("Saving files and starting the processing...")
+        
+        # Reset suggestions from previous runs
+        st.session_state.ai_suggestions = []
+        st.session_state.selected_suggestions = {}
+        st.session_state.current_task_id = None
+        
+        # Upload files to FastAPI and start processing
+        result = upload_files_to_fastapi(uploaded_policy, uploaded_nda)
+        
+        if result:
+            task_id = result.get('task_id')
+            st.success(f"Processing started! Task ID: {task_id}")
+            
+            # Monitor processing status
+            with st.spinner("Processing... This may take a few minutes."):
+                status_data = monitor_processing_status(task_id)
+            
+            if status_data:
+                st.success("✅ Processing complete! AI suggestions are ready for review.")
+                st.experimental_rerun()  # Refresh to show suggestions
+    else:
+        st.warning("Please upload both a policy and an NDA document to proceed.")
+
+# MODIFIED: Display suggestions interface if suggestions are available
+if display_suggestions_interface():
+    # Generate final document button
+    st.markdown("---")
     
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type=media_type
-    )
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("📄 Generate Final Document with Selected Suggestions", type="primary", key="generate_final"):
+            selected_count = sum(1 for selected in st.session_state.selected_suggestions.values() if selected)
+            
+            if selected_count > 0:
+                st.info(f"Generating final document with {selected_count} selected suggestions...")
+                
+                # Use the modified generate_and_save_outputs function
+                files, _, _ = generate_and_save_outputs(None, None)
+                
+                if files:
+                    st.success("🎉 Final document generated successfully!")
+                    
+                    # Display download options
+                    st.subheader("📥 Download Your Customized Documents")
+                    
+                    download_col1, download_col2, download_col3 = st.columns(3)
+                    
+                    with download_col1:
+                        if files.get('html_with_revisions'):
+                            html_filename = os.path.basename(files['html_with_revisions'])
+                            html_content = download_file_from_fastapi(html_filename)
+                            if html_content:
+                                st.download_button(
+                                    label="📄 Download HTML",
+                                    data=html_content,
+                                    file_name=html_filename,
+                                    mime="text/html"
+                                )
+                    
+                    with download_col2:
+                        if files.get('docx_file'):
+                            docx_filename = os.path.basename(files['docx_file'])
+                            docx_content = download_file_from_fastapi(docx_filename)
+                            if docx_content:
+                                st.download_button(
+                                    label="📝 Download DOCX",
+                                    data=docx_content,
+                                    file_name=docx_filename,
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                )
+                    
+                    with download_col3:
+                        if files.get('excel_report'):
+                            excel_filename = os.path.basename(files['excel_report'])
+                            excel_content = download_file_from_fastapi(excel_filename)
+                            if excel_content:
+                                st.download_button(
+                                    label="📊 Download Report",
+                                    data=excel_content,
+                                    file_name=excel_filename,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+            else:
+                st.warning("⚠️ Please select at least one suggestion to generate the final document.")
 
-# Optional: Cleanup endpoint to remove old files and data
-@app.delete("/cleanup/{task_id}")
-async def cleanup_task_data(task_id: str):
-    """Clean up task data and files"""
-    try:
-        # Remove from memory storage
-        if task_id in processing_status:
-            del processing_status[task_id]
-        
-        if task_id in ai_suggestions_storage:
-            del ai_suggestions_storage[task_id]
-        
-        # Remove associated files
-        for filename in os.listdir(INPUT_DIR):
-            if filename.startswith(task_id):
-                os.remove(os.path.join(INPUT_DIR, filename))
-        
-        return {"status": "cleaned up", "task_id": task_id}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ORIGINAL: Display regular results if no suggestions are available but processing is complete
+elif st.session_state.get('show_regular_results', False):
+    # Your existing results display code here...
+    pass
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Add some useful information for users
+with st.expander("ℹ️ How the Enhanced Selection Process Works"):
+    st.markdown("""
+    **This enhanced application now includes AI suggestion selection:**
+    
+    1. **📤 File Upload**: Upload your Policy and NDA documents
+    2. **🤖 AI Processing**: The system analyzes and generates improvement suggestions
+    3. **✅ Review & Select**: Use checkboxes to choose which suggestions to keep
+    4. **📄 Generate Document**: Create final document with only your selected improvements
+    5. **📥 Download**: Get your customized files
+    
+    **Selection Features:**
+    - ✅ Individual checkbox selection for each suggestion
+    - 🔄 Select All / Deselect All for quick decisions
+    - 📊 Real-time counter showing selected suggestions
+    - 💡 Detailed rationale for each AI suggestion
+    - 📈 Confidence scores when available
+    
+    **Technical Details:**
+    - FastAPI Server: `{FASTAPI_BASE_URL}`
+    - Your selections are preserved during the session
+    - Only selected suggestions are applied to the final document
+    """.format(FASTAPI_BASE_URL=FASTAPI_BASE_URL))
