@@ -1,582 +1,432 @@
-
-import streamlit as st
-import requests
-import json
+# Backend Modifications for Enhanced NDA Processing
+from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import os
-from st_diff_viewer import diff_viewer
-
-# Add this to your existing ui.py file
-
-# =============================================================================
-# ENHANCED SESSION STATE MANAGEMENT
-# =============================================================================
-
-def initialize_change_tracking():
-    """Initialize session state variables for change tracking functionality"""
-
-    # Processing stage management
-    if 'processing_stage' not in st.session_state:
-        st.session_state.processing_stage = 'upload'  # upload, review, generate
-
-    # Change tracking
-    if 'document_changes' not in st.session_state:
-        st.session_state.document_changes = []
-
-    if 'change_decisions' not in st.session_state:
-        st.session_state.change_decisions = {}  # change_id: 'accept'/'reject'
-
-    if 'current_change_index' not in st.session_state:
-        st.session_state.current_change_index = 0
-
-    # Document content
-    if 'original_nda_content' not in st.session_state:
-        st.session_state.original_nda_content = ""
-
-    if 'processed_nda_content' not in st.session_state:
-        st.session_state.processed_nda_content = ""
-
-# =============================================================================
-# ENHANCED FASTAPI COMMUNICATION
-# =============================================================================
-
-def upload_files_with_change_extraction(uploaded_policy, uploaded_nda):
-    """Enhanced version of your existing upload function"""
-
-    files = {
-        'policy_file': (uploaded_policy.name, uploaded_policy.getvalue(), uploaded_policy.type),
-        'nda_file': (uploaded_nda.name, uploaded_nda.getvalue(), uploaded_nda.type)
-    }
-
-    # Call enhanced processing endpoint
-    response = requests.post(
-        f"{FASTAPI_URL}/process-with-changes",  # New enhanced endpoint
-        files=files,
-        data={'extract_individual_changes': True}
-    )
-
-    if response.status_code == 200:
-        return response.json()
-    else:
-        st.error(f"Processing failed: {response.status_code}")
-        return None
-
-def apply_change_decisions(task_id, decisions):
-    """Send change decisions to FastAPI for final document generation"""
-
-    payload = {
-        'task_id': task_id,
-        'change_decisions': decisions
-    }
-
-    response = requests.post(f"{FASTAPI_URL}/apply-change-decisions", json=payload)
-
-    if response.status_code == 200:
-        return response.json()
-    else:
-        st.error(f"Failed to apply changes: {response.status_code}")
-        return None
-
-# =============================================================================
-# CHANGE REVIEW INTERFACE
-# =============================================================================
-
-def display_change_review_interface():
-    """Main interface for reviewing document changes"""
-
-    st.header("📋 Review Document Changes")
-
-    if not st.session_state.document_changes:
-        st.warning("No changes found to review.")
-        return
-
-    total_changes = len(st.session_state.document_changes)
-    reviewed_count = len(st.session_state.change_decisions)
-
-    # Progress bar
-    progress = reviewed_count / total_changes if total_changes > 0 else 0
-    st.progress(progress, text=f"Reviewed {reviewed_count} of {total_changes} changes")
-
-    # Navigation
-    col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
-
-    with col_nav1:
-        if st.button("⬅️ Previous", disabled=st.session_state.current_change_index <= 0):
-            st.session_state.current_change_index -= 1
-            st.rerun()
-
-    with col_nav2:
-        # Change selector
-        change_options = [f"Change {i+1}: {change['description'][:30]}..." 
-                         for i, change in enumerate(st.session_state.document_changes)]
-
-        selected_index = st.selectbox(
-            "Select change to review:",
-            range(len(change_options)),
-            format_func=lambda x: change_options[x],
-            index=st.session_state.current_change_index
-        )
-
-        if selected_index != st.session_state.current_change_index:
-            st.session_state.current_change_index = selected_index
-            st.rerun()
-
-    with col_nav3:
-        max_index = len(st.session_state.document_changes) - 1
-        if st.button("Next ➡️", disabled=st.session_state.current_change_index >= max_index):
-            st.session_state.current_change_index += 1
-            st.rerun()
-
-    # Current change display
-    current_change = st.session_state.document_changes[st.session_state.current_change_index]
-    change_id = current_change['id']
-
-    st.divider()
-
-    # Change details card
-    with st.container():
-        st.subheader(f"Change {st.session_state.current_change_index + 1}: {current_change['type'].title()}")
-
-        # Change metadata
-        col_meta1, col_meta2 = st.columns(2)
-        with col_meta1:
-            st.write(f"**Type:** {current_change['type']}")
-            st.write(f"**Section:** {current_change.get('section', 'Unknown')}")
-        with col_meta2:
-            st.write(f"**Confidence:** {current_change.get('confidence', 'N/A')}")
-            current_decision = st.session_state.change_decisions.get(change_id, 'Not reviewed')
-            decision_emoji = {'accept': '✅', 'reject': '❌', 'Not reviewed': '⏳'}[current_decision]
-            st.write(f"**Status:** {decision_emoji} {current_decision}")
-
-        st.write(f"**Description:** {current_change['description']}")
-
-    # Diff visualization
-    st.subheader("📊 Change Comparison")
-
-    # Use diff viewer for text changes
-    try:
-        diff_viewer(
-            old_text=current_change.get('original_text', ''),
-            new_text=current_change.get('new_text', ''),
-            split_view=True,
-            lang='none'
-        )
-    except Exception as e:
-        # Fallback to simple before/after display
-        col_before, col_after = st.columns(2)
-        with col_before:
-            st.write("**Original:**")
-            st.text_area("", value=current_change.get('original_text', ''), disabled=True, key=f"original_{change_id}")
-        with col_after:
-            st.write("**Proposed:**")
-            st.text_area("", value=current_change.get('new_text', ''), disabled=True, key=f"new_{change_id}")
-
-    # Decision buttons
-    st.subheader("🎯 Make Decision")
-
-    col_accept, col_reject, col_skip = st.columns(3)
-
-    with col_accept:
-        if st.button("✅ Accept Change", type="primary", use_container_width=True):
-            st.session_state.change_decisions[change_id] = 'accept'
-            advance_to_next_unreviewed()
-            st.rerun()
-
-    with col_reject:
-        if st.button("❌ Reject Change", type="secondary", use_container_width=True):
-            st.session_state.change_decisions[change_id] = 'reject'
-            advance_to_next_unreviewed()
-            st.rerun()
-
-    with col_skip:
-        if st.button("⏭️ Skip for Now", use_container_width=True):
-            advance_to_next_change()
-            st.rerun()
-
-    # Bulk actions
-    st.divider()
-    st.subheader("⚡ Bulk Actions")
-
-    col_bulk1, col_bulk2, col_bulk3 = st.columns(3)
-
-    with col_bulk1:
-        if st.button("✅ Accept All Remaining"):
-            accept_all_remaining_changes()
-            st.rerun()
-
-    with col_bulk2:
-        if st.button("❌ Reject All Remaining"):
-            reject_all_remaining_changes()
-            st.rerun()
-
-    with col_bulk3:
-        if st.button("🏁 Finish Review"):
-            if len(st.session_state.change_decisions) == len(st.session_state.document_changes):
-                st.session_state.processing_stage = 'generate'
-                st.rerun()
-            else:
-                st.warning("Please review all changes before finishing.")
-
-def advance_to_next_unreviewed():
-    """Move to the next change that hasn't been reviewed yet"""
-    for i in range(st.session_state.current_change_index + 1, len(st.session_state.document_changes)):
-        change_id = st.session_state.document_changes[i]['id']
-        if change_id not in st.session_state.change_decisions:
-            st.session_state.current_change_index = i
-            return
-
-    # If no unreviewed changes found, move to generate stage
-    if len(st.session_state.change_decisions) == len(st.session_state.document_changes):
-        st.session_state.processing_stage = 'generate'
-
-def advance_to_next_change():
-    """Move to the next change regardless of review status"""
-    if st.session_state.current_change_index < len(st.session_state.document_changes) - 1:
-        st.session_state.current_change_index += 1
-
-def accept_all_remaining_changes():
-    """Accept all unreviewed changes"""
-    for change in st.session_state.document_changes:
-        if change['id'] not in st.session_state.change_decisions:
-            st.session_state.change_decisions[change['id']] = 'accept'
-
-def reject_all_remaining_changes():
-    """Reject all unreviewed changes"""
-    for change in st.session_state.document_changes:
-        if change['id'] not in st.session_state.change_decisions:
-            st.session_state.change_decisions[change['id']] = 'reject'
-
-# =============================================================================
-# DOCUMENT GENERATION WITH SELECTED CHANGES
-# =============================================================================
-
-def display_final_generation_interface():
-    """Interface for generating final documents with accepted changes"""
-
-    st.header("🎯 Generate Final Documents")
-
-    # Summary of decisions
-    accepted_count = sum(1 for decision in st.session_state.change_decisions.values() if decision == 'accept')
-    rejected_count = sum(1 for decision in st.session_state.change_decisions.values() if decision == 'reject')
-
-    col_summary1, col_summary2, col_summary3 = st.columns(3)
-
-    with col_summary1:
-        st.metric("Total Changes", len(st.session_state.document_changes))
-    with col_summary2:
-        st.metric("Accepted", accepted_count, delta=accepted_count)
-    with col_summary3:
-        st.metric("Rejected", rejected_count, delta=rejected_count)
-
-    # Change summary table
-    if st.checkbox("Show detailed decision summary"):
-        display_decision_summary_table()
-
-    st.divider()
-
-    # Generate documents button
-    if st.button("🚀 Generate Final Documents", type="primary", use_container_width=True):
-
-        with st.spinner("Generating documents with your accepted changes..."):
-
-            # Send decisions to FastAPI
-            result = apply_change_decisions(
-                task_id=st.session_state.get('task_id'),
-                decisions=st.session_state.change_decisions
-            )
-
-            if result:
-                st.success("✅ Final documents generated successfully!")
-
-                # Display enhanced download options
-                display_enhanced_download_section(result.get('files', {}))
-
-            else:
-                st.error("❌ Failed to generate documents. Please try again.")
-
-    # Option to go back and modify decisions
-    if st.button("🔄 Back to Review Changes"):
-        st.session_state.processing_stage = 'review'
-        st.rerun()
-
-def display_decision_summary_table():
-    """Display a table showing all change decisions"""
-
-    import pandas as pd
-
-    summary_data = []
-    for i, change in enumerate(st.session_state.document_changes):
-        decision = st.session_state.change_decisions.get(change['id'], 'Not reviewed')
-        summary_data.append({
-            'Change #': i + 1,
-            'Type': change['type'],
-            'Description': change['description'][:50] + '...',
-            'Decision': decision,
-            'Status': {'accept': '✅', 'reject': '❌', 'Not reviewed': '⏳'}[decision]
-        })
-
-    df = pd.DataFrame(summary_data)
-    st.dataframe(df, use_container_width=True)
-
-def display_enhanced_download_section(files):
-    """Enhanced download section with final documents"""
-
-    st.subheader("📥 Download Your Customized Documents")
-
-    # Create download layout
-    col_download1, col_download2 = st.columns(2)
-
-    with col_download1:
-        st.write("### 📄 Final HTML Document")
-        st.write("Contains only your accepted changes")
-
-        if files.get('final_html'):
-            html_filename = os.path.basename(files['final_html'])
-            html_content = download_file_from_fastapi(html_filename)
-            if html_content:
-                st.download_button(
-                    label="📄 Download Final HTML",
-                    data=html_content,
-                    file_name=f"approved_nda_{html_filename}",
-                    mime="text/html",
-                    use_container_width=True
-                )
-
-    with col_download2:
-        st.write("### 📄 Final DOCX Document") 
-        st.write("Word document with accepted changes")
-
-        if files.get('final_docx'):
-            docx_filename = os.path.basename(files['final_docx'])
-            docx_content = download_file_from_fastapi(docx_filename)
-            if docx_content:
-                st.download_button(
-                    label="📄 Download Final DOCX",
-                    data=docx_content,
-                    file_name=f"approved_nda_{docx_filename}",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True
-                )
-
-    # Additional files
-    st.write("### 📊 Additional Files")
-
-    col_extra1, col_extra2 = st.columns(2)
-
-    with col_extra1:
-        # Decision log
-        if st.button("📋 Download Decision Log"):
-            decision_log = generate_decision_log()
-            st.download_button(
-                label="📋 Download Decision Log (JSON)",
-                data=decision_log,
-                file_name=f"change_decisions_{st.session_state.get('task_id', 'unknown')}.json",
-                mime="application/json"
-            )
-
-    with col_extra2:
-        # Change report
-        if files.get('change_report'):
-            report_filename = os.path.basename(files['change_report'])
-            report_content = download_file_from_fastapi(report_filename)
-            if report_content:
-                st.download_button(
-                    label="📊 Download Change Report",
-                    data=report_content,
-                    file_name=f"change_report_{report_filename}",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-def generate_decision_log():
-    """Generate a JSON log of all change decisions"""
-
-    decision_log = {
-        'task_id': st.session_state.get('task_id'),
-        'timestamp': pd.Timestamp.now().isoformat(),
-        'total_changes': len(st.session_state.document_changes),
-        'decisions': st.session_state.change_decisions,
-        'summary': {
-            'accepted': sum(1 for d in st.session_state.change_decisions.values() if d == 'accept'),
-            'rejected': sum(1 for d in st.session_state.change_decisions.values() if d == 'reject')
-        },
-        'changes_detail': st.session_state.document_changes
-    }
-
-    return json.dumps(decision_log, indent=2)
-
-# =============================================================================
-# INTEGRATION WITH EXISTING CODE
-# =============================================================================
-
-# MODIFY YOUR EXISTING MAIN PROCESSING SECTION:
-# Replace the existing processing logic after "Processing complete!" with this:
-
-def enhanced_processing_complete_handler(status_data):
-    """Enhanced version of your existing processing complete handler"""
-
-    files = status_data.get('files', {})
-    preview_content = status_data.get('preview_content', '')
-
-    # NEW: Check if changes were extracted
-    if status_data.get('changes'):
-        st.session_state.document_changes = status_data['changes']
-        st.session_state.original_nda_content = status_data.get('original_content', '')
-        st.session_state.processed_nda_content = status_data.get('processed_content', '')
-        st.session_state.task_id = status_data.get('task_id')
-
-        # Show changes found message
-        change_count = len(st.session_state.document_changes)
-        st.success(f"✅ Processing complete! {change_count} changes identified for review.")
-
-        # Option to review changes or use original flow
-        col_option1, col_option2 = st.columns(2)
-
-        with col_option1:
-            if st.button("📋 Review Changes Individually", type="primary", use_container_width=True):
-                st.session_state.processing_stage = 'review'
-                st.rerun()
-
-        with col_option2:
-            if st.button("⚡ Accept All Changes", use_container_width=True):
-                # Accept all changes automatically
-                for change in st.session_state.document_changes:
-                    st.session_state.change_decisions[change['id']] = 'accept'
-                st.session_state.processing_stage = 'generate'
-                st.rerun()
-
-        st.divider()
-        st.subheader("📄 Original Processed Results")
-        st.write("You can still download the original processed files if needed:")
-
-    # Original results display (your existing code)
-    st.subheader("Rewritten NDA (HTML)")
-    if preview_content:
-        st.markdown(preview_content, unsafe_allow_html=True)
-    else:
-        st.warning("No preview content available")
-
-    # Your existing download buttons
-    display_original_download_buttons(files)
-
-# =============================================================================
-# MAIN ENHANCED UI FUNCTION
-# =============================================================================
-
-def main_enhanced():
-    """Enhanced main function with stage management"""
-
-    st.set_page_config(
-        page_title="NDA Processing with Change Review",
-        page_icon="📄",
-        layout="wide"
-    )
-
-    st.title("📄 NDA Processing with LLM - Enhanced")
-
-    # Initialize change tracking
-    initialize_change_tracking()
-
-    # Sidebar navigation
-    with st.sidebar:
-        st.subheader("🧭 Navigation")
-
-        stage_icons = {
-            'upload': '📤',
-            'review': '📋', 
-            'generate': '🎯'
+import sys
+import shutil
+import uuid
+from typing import List, Dict
+import pandas as pd
+from bs4 import BeautifulSoup
+import json
+
+# Add your base directory to the path (adjust as needed)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# Import your existing modules
+from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
+from base.llm_helper import LLMHelper
+from base.file_processing import convert_and_extract_text, analyze_document_fonts
+from base.break_documents_into_parts import break_the_document_into_parts, get_nda_sections_list
+from base.get_nda_analysis import get_nda_review_and_amendments
+from base.processing_amendments import process_amendments
+from base.deduplication_of_amendments import (deduplication_of_amendments, deduplicate_amendments_reports, update_sections_list)
+from base.save_to_excel import save_to_excel_with_multiple_sheets
+from base.utils import preprocess_filename, html_to_clean_docx
+from base.rewrite_nda_section import process_nda_sections
+
+# Create FastAPI app
+app = FastAPI(title="Enhanced NDA Processing Application with Selection")
+
+# Mount static files (for CSS, JS, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Setup templates
+templates = Jinja2Templates(directory="templates")
+
+# Ensure directories exist
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+
+# In-memory storage for processing status and suggestions (in production, use Redis or database)
+processing_status = {}
+ai_suggestions_storage = {}
+
+class AIsuggestion:
+    """Class to represent an AI suggestion"""
+    def __init__(self, section, original_text, suggested_text, rationale, confidence=0.5):
+        self.section = section
+        self.original_text = original_text
+        self.suggested_text = suggested_text
+        self.rationale = rationale
+        self.confidence = confidence
+    
+    def to_dict(self):
+        return {
+            'section': self.section,
+            'original_text': self.original_text,
+            'suggested_text': self.suggested_text,
+            'rationale': self.rationale,
+            'confidence': self.confidence
         }
 
-        current_stage = st.session_state.processing_stage
-        st.write(f"Current Stage: {stage_icons[current_stage]} {current_stage.title()}")
+def extract_suggestions_from_processing_result(amendments_data, nda_sections):
+    """
+    Extract structured AI suggestions from your processing results.
+    This function should be customized based on your actual data structure.
+    """
+    suggestions = []
+    suggestion_id = 1
+    
+    # Example extraction - adapt this to your actual data structure
+    if isinstance(amendments_data, list):
+        for amendment in amendments_data:
+            # Extract relevant information from each amendment
+            section_name = amendment.get('section', f'Section {suggestion_id}')
+            original = amendment.get('original_text', '')
+            suggested = amendment.get('revised_text', amendment.get('suggested_text', ''))
+            reason = amendment.get('rationale', amendment.get('reason', 'AI-generated improvement'))
+            confidence = amendment.get('confidence', 0.75)
+            
+            if suggested and suggested != original:
+                suggestion = AIsuggestion(
+                    section=section_name,
+                    original_text=original,
+                    suggested_text=suggested,
+                    rationale=reason,
+                    confidence=confidence
+                )
+                suggestions.append(suggestion)
+                suggestion_id += 1
+    
+    elif isinstance(amendments_data, dict):
+        # Handle dictionary format
+        for section_key, section_data in amendments_data.items():
+            if isinstance(section_data, dict):
+                original = section_data.get('original', '')
+                suggested = section_data.get('revised', section_data.get('suggested', ''))
+                reason = section_data.get('rationale', 'AI-generated improvement')
+                confidence = section_data.get('confidence', 0.75)
+                
+                if suggested and suggested != original:
+                    suggestion = AIsuggestion(
+                        section=section_key,
+                        original_text=original,
+                        suggested_text=suggested,
+                        rationale=reason,
+                        confidence=confidence
+                    )
+                    suggestions.append(suggestion)
+    
+    return suggestions
 
-        if st.session_state.document_changes:
-            st.write(f"Changes Found: {len(st.session_state.document_changes)}")
-            st.write(f"Decisions Made: {len(st.session_state.change_decisions)}")
-
-        # Reset button
-        if st.button("🔄 Start Over"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-
-    # Stage-based content display
-    if st.session_state.processing_stage == 'upload':
-        display_upload_stage()
-    elif st.session_state.processing_stage == 'review':
-        display_change_review_interface()
-    elif st.session_state.processing_stage == 'generate':
-        display_final_generation_interface()
-
-def display_upload_stage():
-    """Upload stage with your existing logic + enhancements"""
-
-    st.write("Upload your Policy and NDA documents to generate a revised NDA.")
-
-    # Connection status
-    if st.session_state.get('api_connected'):
-        st.success("✅ Connected to FastAPI backend")
-
-    # Your existing upload interface
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Upload Policy Document")
-        uploaded_policy = st.file_uploader(
-            "Drag and drop file here", 
-            type=['doc', 'docx', 'pdf'],
-            help="Limit 200MB per file • DOC, DOCX, PDF",
-            key="policy"
+def process_documents_with_suggestions(policy_file_path, nda_file_path, task_id):
+    """
+    Enhanced version of your processing workflow that extracts suggestions.
+    This replaces your existing run_processing_workflow function.
+    """
+    try:
+        # Update status
+        processing_status[task_id]['status'] = 'processing'
+        processing_status[task_id]['progress'] = 10
+        
+        # Initialize LLM helper
+        llm_helper = LLMHelper()
+        
+        # Convert and extract text from documents
+        processing_status[task_id]['progress'] = 20
+        policy_text = convert_and_extract_text(policy_file_path)
+        nda_text = convert_and_extract_text(nda_file_path)
+        
+        # Break documents into parts
+        processing_status[task_id]['progress'] = 30
+        policy_sections = break_the_document_into_parts(policy_text, "policy")
+        nda_sections_list = get_nda_sections_list(nda_text)
+        
+        # Get NDA analysis and amendments
+        processing_status[task_id]['progress'] = 50
+        amendments_data = get_nda_review_and_amendments(
+            policy_sections, nda_sections_list, llm_helper
         )
-
-    with col2:
-        st.subheader("Upload NDA Document")
-        uploaded_nda = st.file_uploader(
-            "Drag and drop file here",
-            type=['doc', 'docx', 'pdf'], 
-            help="Limit 200MB per file • DOC, DOCX, PDF",
-            key="nda"
+        
+        # Process amendments
+        processing_status[task_id]['progress'] = 70
+        processed_amendments = process_amendments(amendments_data)
+        
+        # Extract AI suggestions from processing results
+        ai_suggestions = extract_suggestions_from_processing_result(
+            processed_amendments, nda_sections_list
         )
+        
+        # Store suggestions for this task
+        ai_suggestions_storage[task_id] = [s.to_dict() for s in ai_suggestions]
+        
+        # Add unique IDs to suggestions
+        for i, suggestion in enumerate(ai_suggestions_storage[task_id]):
+            suggestion['id'] = i + 1
+        
+        # Continue with deduplication and final processing
+        processing_status[task_id]['progress'] = 80
+        deduplicated_amendments = deduplication_of_amendments(processed_amendments)
+        
+        # Generate initial outputs (these will be refined based on user selection)
+        processing_status[task_id]['progress'] = 90
+        nda_filename = os.path.basename(nda_file_path)
+        preprocessed_filename = preprocess_filename(nda_filename)
+        
+        # Save initial results
+        excel_report_path, html_with_revisions, docx_file = generate_and_save_outputs(
+            deduplicated_amendments, preprocessed_filename
+        )
+        
+        # Update status to completed
+        processing_status[task_id]['status'] = 'completed'
+        processing_status[task_id]['progress'] = 100
+        processing_status[task_id]['files'] = {
+            'excel_report': excel_report_path,
+            'html_with_revisions': html_with_revisions,
+            'docx_file': docx_file
+        }
+        processing_status[task_id]['suggestions'] = ai_suggestions_storage[task_id]
+        processing_status[task_id]['preprocessed_filename'] = preprocessed_filename
+        
+        return True
+        
+    except Exception as e:
+        processing_status[task_id]['status'] = 'error'
+        processing_status[task_id]['error'] = str(e)
+        return False
 
-    # Process button (enhanced)
-    if uploaded_policy and uploaded_nda:
-        if st.button("Process Documents", type="primary"):
+def generate_and_save_outputs(amendments_data, preprocessed_filename):
+    """
+    Generate and save output files.
+    This is your existing function, possibly with modifications.
+    """
+    # Your existing implementation here
+    # Return paths to generated files
+    excel_report_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_report.xlsx")
+    html_with_revisions = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.html")
+    docx_file = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.docx")
+    
+    # Your existing file generation logic here...
+    
+    return excel_report_path, html_with_revisions, docx_file
 
-            # Enhanced processing with change extraction
-            result = upload_files_with_change_extraction(uploaded_policy, uploaded_nda)
+def process_selected_suggestions_backend(task_id, selected_suggestion_ids):
+    """
+    Process only the selected suggestions to generate final document.
+    """
+    try:
+        if task_id not in ai_suggestions_storage:
+            raise ValueError("No suggestions found for this task")
+        
+        all_suggestions = ai_suggestions_storage[task_id]
+        selected_suggestions = [
+            s for s in all_suggestions 
+            if s['id'] in selected_suggestion_ids
+        ]
+        
+        if not selected_suggestions:
+            raise ValueError("No valid suggestions selected")
+        
+        # Get the preprocessed filename from the original processing
+        preprocessed_filename = processing_status[task_id]['preprocessed_filename']
+        
+        # Generate new outputs with only selected suggestions
+        # You'll need to implement this based on your specific requirements
+        final_excel_path, final_html_path, final_docx_path = generate_selective_outputs(
+            selected_suggestions, preprocessed_filename
+        )
+        
+        return {
+            'status': 'success',
+            'files': {
+                'excel_report': final_excel_path,
+                'html_with_revisions': final_html_path,
+                'docx_file': final_docx_path
+            },
+            'selected_count': len(selected_suggestions),
+            'total_count': len(all_suggestions)
+        }
+        
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
 
-            if result:
-                task_id = result.get('task_id')
-                st.success(f"Processing started! Task ID: {task_id}")
+def generate_selective_outputs(selected_suggestions, preprocessed_filename):
+    """
+    Generate outputs with only the selected suggestions.
+    You'll need to implement this based on your specific file generation logic.
+    """
+    # Create new filenames for selective processing
+    excel_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_report.xlsx")
+    html_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_revised.html")
+    docx_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_selected_revised.docx")
+    
+    # Implement your file generation logic here
+    # This should create documents with only the selected suggestions
+    
+    # Example implementation (you'll need to adapt this):
+    # 1. Filter your original amendments data to include only selected items
+    # 2. Regenerate the HTML/DOCX with only those amendments
+    # 3. Update the Excel report to show only selected suggestions
+    
+    return excel_path, html_path, docx_path
 
-                # Monitor processing with change extraction
-                with st.spinner("Processing... This may take a few minutes."):
-                    status_data = monitor_processing_status(task_id)
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    """Serve the main HTML page"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Enhanced NDA Processing API</title>
+    </head>
+    <body>
+        <h1>Enhanced NDA Processing Application</h1>
+        <p>Upload your Policy and NDA documents to generate AI suggestions with selection capability.</p>
+        <h2>Available Endpoints:</h2>
+        <ul>
+            <li><strong>POST /process</strong> - Upload documents and start processing</li>
+            <li><strong>GET /status/{task_id}</strong> - Check processing status</li>
+            <li><strong>POST /process_selections</strong> - Process selected suggestions</li>
+            <li><strong>GET /download/{filename}</strong> - Download generated files</li>
+        </ul>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
-                    if status_data:
-                        enhanced_processing_complete_handler(status_data)
-                    else:
-                        st.error("Processing failed or timed out")
-            else:
-                st.warning("Please upload both a policy and an NDA document to proceed.")
+@app.post("/process")
+async def process_files(
+    background_tasks: BackgroundTasks,
+    policy_file: UploadFile = File(...),
+    nda_file: UploadFile = File(...)
+):
+    """Enhanced processing endpoint that generates AI suggestions"""
+    
+    # Generate unique task ID
+    task_id = str(uuid.uuid4())
+    
+    # Initialize processing status
+    processing_status[task_id] = {
+        'status': 'started',
+        'progress': 0,
+        'task_id': task_id
+    }
+    
+    try:
+        # Save uploaded files
+        policy_path = os.path.join(INPUT_DIR, f"{task_id}_policy_{policy_file.filename}")
+        nda_path = os.path.join(INPUT_DIR, f"{task_id}_nda_{nda_file.filename}")
+        
+        with open(policy_path, "wb") as buffer:
+            shutil.copyfileobj(policy_file.file, buffer)
+        
+        with open(nda_path, "wb") as buffer:
+            shutil.copyfileobj(nda_file.file, buffer)
+        
+        # Start background processing
+        background_tasks.add_task(
+            process_documents_with_suggestions,
+            policy_path,
+            nda_path,
+            task_id
+        )
+        
+        return {"task_id": task_id, "status": "started"}
+        
+    except Exception as e:
+        processing_status[task_id]['status'] = 'error'
+        processing_status[task_id]['error'] = str(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# =============================================================================
-# USAGE INSTRUCTIONS
-# =============================================================================
-"""
-To integrate this enhanced functionality into your existing ui.py:
+@app.get("/status/{task_id}")
+async def get_status(task_id: str):
+    """Get processing status with suggestions"""
+    if task_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    status_data = processing_status[task_id].copy()
+    
+    # Include suggestions in the response when processing is complete
+    if status_data['status'] == 'completed' and task_id in ai_suggestions_storage:
+        status_data['suggestions'] = ai_suggestions_storage[task_id]
+    
+    return status_data
 
-1. Install the required dependencies:
-   pip install st-diff-viewer html-diff
+@app.post("/process_selections")
+async def process_selections(selection_data: dict):
+    """New endpoint to process user's suggestion selections"""
+    
+    try:
+        task_id = selection_data.get('task_id')
+        selected_suggestion_ids = selection_data.get('selected_suggestion_ids', [])
+        
+        if not task_id:
+            raise HTTPException(status_code=400, detail="task_id is required")
+        
+        if task_id not in processing_status:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        if processing_status[task_id]['status'] != 'completed':
+            raise HTTPException(status_code=400, detail="Original processing not completed")
+        
+        # Process selected suggestions
+        result = process_selected_suggestions_backend(task_id, selected_suggestion_ids)
+        
+        if result['status'] == 'error':
+            raise HTTPException(status_code=500, detail=result['error'])
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-2. Add the functions above to your ui.py file
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    """Download generated files"""
+    file_path = os.path.join(OUTPUT_DIR, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Determine media type based on file extension
+    if filename.endswith('.html'):
+        media_type = 'text/html'
+    elif filename.endswith('.docx'):
+        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    elif filename.endswith('.xlsx'):
+        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    else:
+        media_type = 'application/octet-stream'
+    
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type=media_type
+    )
 
-3. Replace your existing main processing logic with main_enhanced()
+# Optional: Cleanup endpoint to remove old files and data
+@app.delete("/cleanup/{task_id}")
+async def cleanup_task_data(task_id: str):
+    """Clean up task data and files"""
+    try:
+        # Remove from memory storage
+        if task_id in processing_status:
+            del processing_status[task_id]
+        
+        if task_id in ai_suggestions_storage:
+            del ai_suggestions_storage[task_id]
+        
+        # Remove associated files
+        for filename in os.listdir(INPUT_DIR):
+            if filename.startswith(task_id):
+                os.remove(os.path.join(INPUT_DIR, filename))
+        
+        return {"status": "cleaned up", "task_id": task_id}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-4. Modify your FastAPI backend to support the new endpoints:
-   - /process-with-changes (enhanced processing)
-   - /apply-change-decisions (generate final docs)
-
-5. Update your monitor_processing_status function to handle change data
-
-The enhanced UI will seamlessly integrate with your existing workflow while
-adding the powerful change review functionality you requested.
-"""
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
