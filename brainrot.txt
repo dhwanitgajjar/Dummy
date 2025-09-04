@@ -5,38 +5,41 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import requests
 import time
+import io
 
-# Adjust the path to import from the 'base' directory correctly
+# Configuration for FastAPI backend
+FASTAPI_BASE_URL = "http://localhost:8000"  # Adjust this to your FastAPI server URL
+
+# Adjust the path to import from the 'base' directory correctly (if needed for constants)
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-# Import all necessary functions from your main.py and other modules
-from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
-from base.llm_helper import LLMHelper
-from base.file_processing import convert_and_extract_text, analyze_document_fonts
-from base.break_documents_into_parts import break_the_document_into_parts, get_nda_sections_list
-from base.get_nda_analysis import get_nda_review_and_amendments
-from base.processing_amendments import process_amendments
-from base.deduplication_of_amendments import deduplication_of_amendments, deduplicate_amendments_reports, update_sections_list
-from base.save_to_excel import save_to_excel_with_multiple_sheets
-from base.utils import preprocess_filename, html_to_clean_docx
-from base.rewrite_nda_section import process_nda_sections
+# Import only constants if needed for display purposes
+try:
+    from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
+except ImportError:
+    # Fallback values if constants not available
+    INPUT_DIR = "input"
+    OUTPUT_DIR = "output"
+    GPT_MODEL = "gpt-4"
+    MULTIPLIER = 1
+    SKIP_MAX_ATTEMPTS = False
+    CLAUSES_PRESENT = True
 
-# Ensure INPUT_DIR and OUTPUT_DIR exist
+# Ensure directories exist (for local file handling if needed)
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Configuration for your existing FastAPI
-FASTAPI_BASE_URL = "http://localhost:8000"  # Your existing FastAPI URL
-
-# Initialize session state for suggestion workflow
+# Initialize session state for managing workflow stages
 if 'processing_stage' not in st.session_state:
     st.session_state.processing_stage = 'upload'
+if 'task_id' not in st.session_state:
+    st.session_state.task_id = None
 if 'suggestions_data' not in st.session_state:
     st.session_state.suggestions_data = None
 if 'accepted_suggestions' not in st.session_state:
     st.session_state.accepted_suggestions = {}
 
-# Function to save uploaded file (UNCHANGED from your original)
+# Function to save uploaded file (kept for compatibility)
 def save_uploaded_file(uploaded_file, directory):
     """Saves an uploaded file to a specified directory."""
     if uploaded_file is not None:
@@ -46,124 +49,191 @@ def save_uploaded_file(uploaded_file, directory):
         return file_path
     return None
 
-# Your original processing function (UNCHANGED)
-def run_processing_workflow(policy_file_path, nda_file_path, multiplier, llm_helper):
-    """
-    Encapsulates the core processing logic from your main.py.
-    This function takes file paths and other dependencies as arguments.
-    """
-    # Extract the policy text
-    policy_returned_filename, policy_text = convert_and_extract_text(INPUT_DIR, os.path.basename(policy_file_path))
-
-    # Extract the NDA text
-    nda_returned_filename, nda_text = convert_and_extract_text(INPUT_DIR, os.path.basename(nda_file_path))
-
-    # Break the document into parts
-    structured_parts = break_the_document_into_parts(nda_text, nda_returned_filename)
-    nda_sections_list = get_nda_sections_list(structured_parts)
-
-    # Generate amendments report
-    list_of_amendments = get_nda_review_and_amendments(policy_text, nda_text, nda_sections_list, llm_helper)
-    amendments_report = process_amendments(list_of_amendments)
-    dedup_analysis, id_to_amendment = deduplication_of_amendments(amendments_report, llm_helper)
-    dedup_amendments_report = deduplicate_amendments_reports(dedup_analysis, id_to_amendment)
-    updated_list = update_sections_list(nda_sections_list, dedup_amendments_report)
-
-    # Save reports to excel
-    preprocessed_filename = preprocess_filename(os.path.basename(nda_file_path))
-    reports_filename = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_amendments_report.xlsx")
-    data_dict = {
-        "Amendments Report": pd.DataFrame(amendments_report),
-        "DeDuplication Analysis": pd.DataFrame(dedup_analysis),
-        "Dedup Amendments Report": pd.DataFrame(dedup_amendments_report),
-        "NDA Sections": pd.DataFrame(nda_sections_list),
-    }
-    save_to_excel_with_multiple_sheets(data_dict, reports_filename)
-
-    # Return data for suggestion review instead of final processing
-    return {
-        'dedup_amendments_report': dedup_amendments_report,
-        'updated_list': updated_list,
-        'nda_sections_list': nda_sections_list,
-        'reports_filename': reports_filename,
-        'preprocessed_filename': preprocessed_filename
-    }
-
-# NEW: Function to generate final output with only accepted suggestions
-def run_final_processing_with_accepted_suggestions(suggestions_data, accepted_suggestions, uploaded_nda_name):
-    """Generate final output using only accepted suggestions"""
+def upload_files_to_fastapi(policy_file, nda_file):
+    """Upload files to FastAPI backend and start processing for suggestions"""
     try:
-        # Filter amendments to only include accepted ones
-        filtered_amendments = []
-        for i, amendment in enumerate(suggestions_data['dedup_amendments_report']):
-            if accepted_suggestions.get(f"suggestion_{i}", False):
-                filtered_amendments.append(amendment)
+        # Prepare files for upload
+        files = {
+            'policy_file': (policy_file.name, policy_file.getvalue(), policy_file.type),
+            'nda_file': (nda_file.name, nda_file.getvalue(), nda_file.type)
+        }
 
-        # If no suggestions were accepted, use original content
-        if not filtered_amendments:
-            st.warning("No suggestions were accepted. Using original content.")
-            original_sections = [str(section) for section in suggestions_data['nda_sections_list']]
-            return " ".join(original_sections)
+        # Make API call to start processing
+        response = requests.post(f"{FASTAPI_BASE_URL}/process", files=files)
 
-        # Initialize LLM helper for final processing
-        llm_helper = LLMHelper(GPT_MODEL)
-        multiplier = MULTIPLIER
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Upload failed: {response.status_code} - {response.text}")
+            return None
 
-        # Process only accepted amendments
-        result = process_nda_sections(suggestions_data['updated_list'], suggestions_data['nda_sections_list'], filtered_amendments, llm_helper, multiplier)
-        rewritten_nda_sections_text = " ".join(result)
-
-        return rewritten_nda_sections_text
-
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot connect to FastAPI server. Make sure it's running on port 8000.")
+        return None
     except Exception as e:
-        st.error(f"Error in final processing: {str(e)}")
+        st.error(f"Error uploading files: {str(e)}")
         return None
 
-# Your original output generation function (UNCHANGED)
-def generate_and_save_outputs(rewritten_nda_sections_text, nda_filename):
-    """Generates and saves the HTML and DOCX outputs."""
-    preprocessed_filename = preprocess_filename(nda_filename)
+def monitor_suggestions_processing(task_id):
+    """Monitor processing status for suggestion generation"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    # Generate HTML version
-    rewritten_nda_html_filename = os.path.join(OUTPUT_DIR, preprocessed_filename + f"_rewritten_nda_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.html")
-    with open(rewritten_nda_html_filename, "w", encoding="utf-8") as f:
-        f.write(rewritten_nda_sections_text)
+    max_attempts = 60  # 5 minutes with 5-second intervals
+    attempt = 0
 
-    # Generate HTML version without rationale
-    soup = BeautifulSoup(rewritten_nda_sections_text, 'html.parser')
-    for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-        if tag.text.strip() in ['HEADER', 'FOOTER']:
-            tag.decompose()
-    if not CLAUSES_PRESENT:
-        for tag in soup.find_all('h2'):
-            tag.decompose()
-    for span in soup.find_all('span', style=True):
-        if 'background-color:yellow' in span['style'].replace(' ', '').lower():
-            span.decompose()
-    for p in soup.find_all('p', style=True):
-        if 'background-color:yellow' in p['style'].replace(' ', '').lower():
-            p.decompose()
+    while attempt < max_attempts:
+        try:
+            response = requests.get(f"{FASTAPI_BASE_URL}/status/{task_id}")
 
-    rewritten_nda_html_no_rationale_filename = os.path.join(OUTPUT_DIR, preprocessed_filename + f"_rewritten_nda_with_no_rationale_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.html")
-    with open(rewritten_nda_html_no_rationale_filename, 'w', encoding='utf-8') as f:
-        f.write(str(soup))
+            if response.status_code == 200:
+                status_data = response.json()
+                status = status_data.get('status', 'unknown')
+                progress = status_data.get('progress', 0)
+                stage = status_data.get('stage', 'processing')
 
-    # Generate DOCX version
-    FONT_NAME = analyze_document_fonts(INPUT_DIR, nda_filename)
-    rewritten_nda_docx_filename = os.path.join(OUTPUT_DIR, preprocessed_filename + f"_cleaned_rewritten_nda_{'v1' if SKIP_MAX_ATTEMPTS else 'v2'}.docx")
-    html_to_clean_docx(str(soup), rewritten_nda_docx_filename, FONT_NAME)
+                # Update progress bar and status
+                progress_bar.progress(progress / 100.0)
+                status_text.text(f"Status: {status} | Progress: {progress}% | Stage: {stage}")
 
-    return rewritten_nda_html_filename, rewritten_nda_docx_filename, rewritten_nda_html_no_rationale_filename
+                if status == 'suggestions_ready':
+                    progress_bar.progress(1.0)
+                    status_text.success("Suggestions generated successfully!")
+                    return True
 
-# NEW: Display suggestions with checkboxes
+                elif status == 'error':
+                    error_msg = status_data.get('error', 'Unknown error')
+                    status_text.error(f"Processing failed: {error_msg}")
+                    return False
+
+                else:
+                    # Still processing, wait and check again
+                    time.sleep(5)
+                    attempt += 1
+
+            else:
+                status_text.error(f"Status check failed: {response.status_code}")
+                return False
+
+        except Exception as e:
+            status_text.error(f"Error checking status: {str(e)}")
+            return False
+
+    status_text.error("Processing timeout - took too long (5+ minutes)")
+    return False
+
+def get_suggestions_from_fastapi(task_id):
+    """Get suggestions from FastAPI backend"""
+    try:
+        response = requests.get(f"{FASTAPI_BASE_URL}/suggestions/{task_id}")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Failed to get suggestions: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error getting suggestions: {str(e)}")
+        return None
+
+def submit_accepted_suggestions(task_id, accepted_suggestions):
+    """Submit accepted suggestions to FastAPI backend"""
+    try:
+        data = {
+            "task_id": task_id,
+            "accepted_suggestions": accepted_suggestions
+        }
+        response = requests.post(f"{FASTAPI_BASE_URL}/accept-suggestions", json=data)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Failed to submit suggestions: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error submitting suggestions: {str(e)}")
+        return None
+
+def generate_final_document(task_id):
+    """Generate final document with accepted suggestions"""
+    try:
+        response = requests.post(f"{FASTAPI_BASE_URL}/generate-final/{task_id}")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Failed to generate final document: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error generating final document: {str(e)}")
+        return None
+
+def monitor_final_processing(task_id):
+    """Monitor processing status for final document generation"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    max_attempts = 60  # 5 minutes with 5-second intervals
+    attempt = 0
+
+    while attempt < max_attempts:
+        try:
+            response = requests.get(f"{FASTAPI_BASE_URL}/status/{task_id}")
+
+            if response.status_code == 200:
+                status_data = response.json()
+                status = status_data.get('status', 'unknown')
+                progress = status_data.get('progress', 0)
+                stage = status_data.get('stage', 'processing')
+
+                # Update progress bar and status
+                progress_bar.progress(progress / 100.0)
+                status_text.text(f"Status: {status} | Progress: {progress}% | Stage: {stage}")
+
+                if status == 'completed':
+                    progress_bar.progress(1.0)
+                    status_text.success("Final document generated successfully!")
+                    return status_data
+
+                elif status == 'error':
+                    error_msg = status_data.get('error', 'Unknown error')
+                    status_text.error(f"Processing failed: {error_msg}")
+                    return None
+
+                else:
+                    # Still processing, wait and check again
+                    time.sleep(5)
+                    attempt += 1
+
+            else:
+                status_text.error(f"Status check failed: {response.status_code}")
+                return None
+
+        except Exception as e:
+            status_text.error(f"Error checking status: {str(e)}")
+            return None
+
+    status_text.error("Processing timeout - took too long (5+ minutes)")
+    return None
+
+def download_file_from_fastapi(filename):
+    """Download a file from FastAPI backend"""
+    try:
+        response = requests.get(f"{FASTAPI_BASE_URL}/download/{filename}")
+        if response.status_code == 200:
+            return response.content
+        else:
+            st.error(f"Download failed for {filename}: {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Error downloading {filename}: {str(e)}")
+        return None
+
 def display_suggestion_review(suggestions_data):
     """Display suggestions with checkboxes for user to accept/reject"""
     st.header("📋 Review and Accept Suggestions")
     st.markdown("Review the suggestions below and check the ones you want to accept. Only accepted suggestions will be applied to the final document.")
 
-    dedup_amendments_report = suggestions_data['dedup_amendments_report']
+    suggestions = suggestions_data.get('suggestions', [])
 
-    if not dedup_amendments_report:
+    if not suggestions:
         st.warning("No suggestions were generated for this document.")
         return False
 
@@ -171,38 +241,43 @@ def display_suggestion_review(suggestions_data):
     col1, col2, col3 = st.columns([1, 1, 4])
     with col1:
         if st.button("✅ Accept All"):
-            for i in range(len(dedup_amendments_report)):
-                st.session_state.accepted_suggestions[f"suggestion_{i}"] = True
+            for suggestion in suggestions:
+                suggestion_key = suggestion['suggestion_key']
+                st.session_state.accepted_suggestions[suggestion_key] = True
             st.rerun()
     with col2:
         if st.button("❌ Reject All"):
-            for i in range(len(dedup_amendments_report)):
-                st.session_state.accepted_suggestions[f"suggestion_{i}"] = False
+            for suggestion in suggestions:
+                suggestion_key = suggestion['suggestion_key']
+                st.session_state.accepted_suggestions[suggestion_key] = False
             st.rerun()
 
     st.markdown("---")
 
     # Display each suggestion with checkbox
-    for i, amendment in enumerate(dedup_amendments_report):
-        suggestion_key = f"suggestion_{i}"
+    for suggestion in suggestions:
+        suggestion_key = suggestion['suggestion_key']
+        suggestion_id = suggestion['id']
 
+        # Create a container for each suggestion
         with st.container():
             col_check, col_content = st.columns([0.1, 0.9])
 
             with col_check:
+                # Checkbox for accepting/rejecting suggestion
                 accepted = st.checkbox(
                     "Accept", 
                     key=suggestion_key,
-                    value=st.session_state.accepted_suggestions.get(suggestion_key, True)
+                    value=st.session_state.accepted_suggestions.get(suggestion_key, suggestion.get('accepted', True))
                 )
                 st.session_state.accepted_suggestions[suggestion_key] = accepted
 
             with col_content:
-                # Get suggestion details
-                suggestion_title = str(amendment.get('title', amendment.get('suggestion', f'Suggestion {i+1}')))
-                suggestion_content = str(amendment.get('suggestion', amendment.get('content', 'No content available')))
-                suggestion_rationale = str(amendment.get('rationale', 'No rationale provided'))
-                section = str(amendment.get('section', 'Unknown section'))
+                # Display suggestion details
+                suggestion_title = suggestion.get('title', f'Suggestion {suggestion_id+1}')
+                suggestion_content = suggestion.get('content', 'No content available')
+                suggestion_rationale = suggestion.get('rationale', 'No rationale provided')
+                section = suggestion.get('section', 'Unknown section')
 
                 # Color code based on acceptance
                 if accepted:
@@ -214,16 +289,16 @@ def display_suggestion_review(suggestions_data):
                 with st.expander(f"View details for {suggestion_title}"):
                     st.markdown(f"**Suggestion:** {suggestion_content}")
                     st.markdown(f"**Rationale:** {suggestion_rationale}")
-                    if 'original_text' in amendment:
-                        st.markdown(f"**Original Text:** {amendment['original_text']}")
-                    if 'proposed_text' in amendment:
-                        st.markdown(f"**Proposed Text:** {amendment['proposed_text']}")
+                    if suggestion.get('original_text'):
+                        st.markdown(f"**Original Text:** {suggestion['original_text']}")
+                    if suggestion.get('proposed_text'):
+                        st.markdown(f"**Proposed Text:** {suggestion['proposed_text']}")
 
         st.markdown("---")
 
     # Summary
     accepted_count = sum(1 for v in st.session_state.accepted_suggestions.values() if v)
-    total_count = len(dedup_amendments_report)
+    total_count = len(suggestions)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -233,8 +308,8 @@ def display_suggestion_review(suggestions_data):
 
     return True
 
-# --- Streamlit UI (Same styling as your original) ---
-st.set_page_config(page_title="Document Processing App", layout="wide")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Document Processing App with Suggestions", layout="wide")
 st.markdown(
     """
     <style>
@@ -245,146 +320,254 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-st.title("NDA Processing with LLM")
-st.markdown("Upload your Policy and NDA documents to generate a revised NDA.")
+st.title("NDA Processing with LLM - Enhanced with Suggestions")
+st.markdown("Upload your Policy and NDA documents, review suggestions with checkboxes, and generate a customized revised NDA.")
 
-# Check if using local processing or FastAPI
-use_fastapi = st.sidebar.checkbox("Use FastAPI Backend", value=False, help="Enable to use FastAPI backend instead of local processing")
+# Display FastAPI connection status
+try:
+    response = requests.get(f"{FASTAPI_BASE_URL}/", timeout=5)
+    if response.status_code == 200:
+        st.success("✅ Connected to FastAPI backend with suggestions support")
+    else:
+        st.warning(f"⚠️ FastAPI backend responded with status: {response.status_code}")
+except:
+    st.error("❌ Cannot connect to FastAPI backend. Make sure it's running on port 8000.")
+    st.info("Run: `uvicorn fastapi_with_suggestions:app --reload` to start the FastAPI server")
 
-if use_fastapi:
-    st.sidebar.info("Using FastAPI backend - make sure your FastAPI server is running")
-else:
-    st.sidebar.info("Using local processing - all processing happens in Streamlit")
-
-# Stage 1: Upload Documents
+# Stage 1: File Upload and Initial Processing
 if st.session_state.processing_stage == 'upload':
-    # File uploaders (same as your original)
+    # File uploaders
     col1, col2 = st.columns(2)
     with col1:
         uploaded_policy = st.file_uploader("Upload Policy Document", type=["doc", "docx", "pdf"])
     with col2:
         uploaded_nda = st.file_uploader("Upload NDA Document", type=["doc", "docx", "pdf"])
 
-    # Process button
-    if st.button("Process Documents"):
+    # Processing button
+    if st.button("Generate Suggestions"):
         if uploaded_policy and uploaded_nda:
-            st.info("Saving files and starting the processing...")
+            st.info("Uploading files and generating suggestions...")
 
-            # Save files locally (same as your original)
-            policy_path = save_uploaded_file(uploaded_policy, INPUT_DIR)
-            nda_path = save_uploaded_file(uploaded_nda, INPUT_DIR)
+            # Upload files to FastAPI and start processing
+            result = upload_files_to_fastapi(uploaded_policy, uploaded_nda)
 
-            if policy_path and nda_path:
-                with st.spinner("Processing... This may take a few minutes."):
-                    try:
-                        # Use your EXACT original processing workflow
-                        llm_helper = LLMHelper(GPT_MODEL)
-                        multiplier = MULTIPLIER
+            if result:
+                task_id = result.get('task_id')
+                st.session_state.task_id = task_id
+                st.success(f"Processing started! Task ID: {task_id}")
 
-                        # Run processing to get suggestions (using your exact methods)
-                        suggestions_data = run_processing_workflow(policy_path, nda_path, multiplier, llm_helper)
+                # Monitor processing status
+                with st.spinner("Generating suggestions... This may take a few minutes."):
+                    success = monitor_suggestions_processing(task_id)
 
-                        # Store data and move to review stage
-                        st.session_state.suggestions_data = suggestions_data
-                        st.session_state.uploaded_nda_name = uploaded_nda.name
-                        st.session_state.processing_stage = 'review'
-
-                        st.success("Processing complete! Now you can review and select suggestions.")
-                        st.rerun()
-
-                    except Exception as e:
-                        st.error(f"An error occurred during processing: {e}")
+                    if success:
+                        # Get suggestions from API
+                        suggestions_data = get_suggestions_from_fastapi(task_id)
+                        if suggestions_data:
+                            st.session_state.suggestions_data = suggestions_data
+                            st.session_state.processing_stage = 'review'
+                            st.success("Suggestions generated successfully!")
+                            st.rerun()
         else:
             st.warning("Please upload both a policy and an NDA document to proceed.")
 
 # Stage 2: Review Suggestions
 elif st.session_state.processing_stage == 'review':
-    display_suggestion_review(st.session_state.suggestions_data)
+    # Display suggestions for review
+    has_suggestions = display_suggestion_review(st.session_state.suggestions_data)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         if st.button("🔄 Start Over"):
+            # Reset session state
             st.session_state.processing_stage = 'upload'
+            st.session_state.task_id = None
             st.session_state.suggestions_data = None
             st.session_state.accepted_suggestions = {}
             st.rerun()
 
     with col2:
         if st.button("✅ Generate Final Document"):
-            st.session_state.processing_stage = 'final'
-            st.rerun()
+            if has_suggestions:
+                # Submit accepted suggestions to FastAPI
+                result = submit_accepted_suggestions(st.session_state.task_id, st.session_state.accepted_suggestions)
+                if result:
+                    st.session_state.processing_stage = 'final'
+                    st.rerun()
 
 # Stage 3: Generate Final Document
 elif st.session_state.processing_stage == 'final':
     st.header("📄 Generating Final Document")
 
-    with st.spinner("Generating final document with your accepted suggestions..."):
-        try:
-            # Generate final content with only accepted suggestions
-            rewritten_html_content = run_final_processing_with_accepted_suggestions(
-                st.session_state.suggestions_data, 
-                st.session_state.accepted_suggestions, 
-                st.session_state.uploaded_nda_name
-            )
+    # Start final document generation
+    result = generate_final_document(st.session_state.task_id)
+    if result:
+        with st.spinner("Generating final document with your accepted suggestions..."):
+            status_data = monitor_final_processing(st.session_state.task_id)
 
-            if rewritten_html_content:
-                # Generate and save output files (using your original function)
-                html_path, docx_path, html_no_rationale_path = generate_and_save_outputs(
-                    rewritten_html_content, 
-                    st.session_state.uploaded_nda_name
-                )
+            if status_data:
+                st.success("Final document generated successfully!")
 
-                preprocessed_filename = preprocess_filename(st.session_state.uploaded_nda_name)
+                # Display results
+                files = status_data.get('files', {})
+                preview_content = status_data.get('preview_content', '')
+                accepted_count = status_data.get('accepted_count', 0)
+                total_count = status_data.get('total_count', 0)
 
-                st.success("Processing complete!")
-
-                # Display results (same as your original)
+                # Display and Download Buttons
                 st.subheader("Results")
-                excel_report_path = st.session_state.suggestions_data['reports_filename']
-                st.markdown(f"**Reports saved to:** `{excel_report_path}`")
+                excel_report_path = files.get('excel_report', '')
+                st.markdown(f"**Reports saved to:** `{os.path.basename(excel_report_path) if excel_report_path else 'Unknown'}`")
 
                 # Show summary of accepted suggestions
-                accepted_count = sum(1 for v in st.session_state.accepted_suggestions.values() if v)
-                total_count = len(st.session_state.suggestions_data['dedup_amendments_report'])
                 st.info(f"Applied {accepted_count} out of {total_count} suggested changes")
 
-                # Show the HTML result directly in the app (same as your original)
+                # Show the HTML result directly in the app
                 st.subheader("Rewritten NDA (HTML)")
-                st.markdown(rewritten_html_content, unsafe_allow_html=True)
+                if preview_content:
+                    st.markdown(preview_content, unsafe_allow_html=True)
+                else:
+                    st.warning("No preview content available")
 
-                # Download buttons (same as your original)
-                with open(html_path, "r", encoding="utf-8") as f:
-                    st.download_button(
-                        label="Download Rewritten HTML",
-                        data=f.read(),
-                        file_name=os.path.basename(html_path),
-                        mime="text/html"
-                    )
+                # Download buttons
+                st.subheader("Download Files")
 
-                with open(docx_path, "rb") as f:
-                    st.download_button(
-                        label="Download Rewritten DOCX",
-                        data=f.read(),
-                        file_name=os.path.basename(docx_path),
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
+                # Create download buttons for each file
+                download_col1, download_col2 = st.columns(2)
 
-                # Navigation options
+                with download_col1:
+                    # Download Rewritten HTML
+                    if files.get('html_with_revisions'):
+                        html_filename = os.path.basename(files['html_with_revisions'])
+                        html_content = download_file_from_fastapi(html_filename)
+                        if html_content:
+                            st.download_button(
+                                label="Download Rewritten HTML",
+                                data=html_content,
+                                file_name=html_filename,
+                                mime="text/html"
+                            )
+
+                with download_col2:
+                    # Download Rewritten DOCX
+                    if files.get('docx_file'):
+                        docx_filename = os.path.basename(files['docx_file'])
+                        docx_content = download_file_from_fastapi(docx_filename)
+                        if docx_content:
+                            st.download_button(
+                                label="Download Rewritten DOCX",
+                                data=docx_content,
+                                file_name=docx_filename,
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            )
+
+                # Additional download options
+                st.subheader("Additional Downloads")
+                download_col3, download_col4 = st.columns(2)
+
+                with download_col3:
+                    # Download Excel Report
+                    if files.get('excel_report'):
+                        excel_filename = os.path.basename(files['excel_report'])
+                        excel_content = download_file_from_fastapi(excel_filename)
+                        if excel_content:
+                            st.download_button(
+                                label="Download Excel Report",
+                                data=excel_content,
+                                file_name=excel_filename,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+
+                with download_col4:
+                    # Download HTML without rationale
+                    if files.get('html_no_rationale'):
+                        html_no_rat_filename = os.path.basename(files['html_no_rationale'])
+                        html_no_rat_content = download_file_from_fastapi(html_no_rat_filename)
+                        if html_no_rat_content:
+                            st.download_button(
+                                label="Download HTML (No Rationale)",
+                                data=html_no_rat_content,
+                                file_name=html_no_rat_filename,
+                                mime="text/html"
+                            )
+
+                # Additional options
+                st.subheader("Additional Options")
                 col1, col2 = st.columns(2)
+
                 with col1:
                     if st.button("📝 Review Suggestions Again"):
                         st.session_state.processing_stage = 'review'
                         st.rerun()
+
                 with col2:
                     if st.button("🔄 Start New Document"):
+                        # Reset session state
                         st.session_state.processing_stage = 'upload'
+                        st.session_state.task_id = None
                         st.session_state.suggestions_data = None
                         st.session_state.accepted_suggestions = {}
                         st.rerun()
 
-        except Exception as e:
-            st.error(f"An error occurred during final processing: {e}")
-            if st.button("🔄 Back to Review"):
-                st.session_state.processing_stage = 'review'
-                st.rerun()
+# Sidebar with workflow status
+with st.sidebar:
+    st.header("📊 Workflow Status")
+
+    if st.session_state.processing_stage == 'upload':
+        st.success("1. Upload Documents")
+        st.info("2. Review Suggestions")
+        st.info("3. Generate Final Document")
+    elif st.session_state.processing_stage == 'review':
+        st.success("1. Upload Documents ✅")
+        st.success("2. Review Suggestions")
+        st.info("3. Generate Final Document")
+    elif st.session_state.processing_stage == 'final':
+        st.success("1. Upload Documents ✅")
+        st.success("2. Review Suggestions ✅")
+        st.success("3. Generate Final Document")
+
+    if st.session_state.suggestions_data:
+        st.markdown("---")
+        st.subheader("📈 Current Session")
+        total_suggestions = st.session_state.suggestions_data.get('total_count', 0)
+        accepted_suggestions = sum(1 for v in st.session_state.accepted_suggestions.values() if v)
+        st.metric("Total Suggestions", total_suggestions)
+        st.metric("Accepted", accepted_suggestions)
+        st.metric("Rejected", total_suggestions - accepted_suggestions)
+
+        if st.session_state.task_id:
+            st.markdown(f"**Task ID:** `{st.session_state.task_id}`")
+
+# Add some useful information for users
+with st.expander("ℹ️ How it works"):
+    st.markdown(f"""
+    **This application uses a FastAPI backend for enhanced processing:**
+
+    1. **Upload Documents**: Upload your policy and NDA documents
+    2. **Generate Suggestions**: The system analyzes documents and generates suggestions
+    3. **Review & Select**: Use checkboxes to accept/reject individual suggestions
+    4. **Generate Final**: Create final document with only your accepted suggestions
+    5. **Download**: Get the customized files with only approved changes
+
+    **Technical Details:**
+    - FastAPI Server: `{FASTAPI_BASE_URL}`
+    - Processing runs asynchronously on the backend
+    - Each suggestion can be individually accepted or rejected
+    - Final output contains only your approved changes
+    - All generated files are available for download
+    """)
+
+with st.expander("🔧 Configuration"):
+    st.markdown(f"""
+    **Current Configuration:**
+    - FastAPI URL: `{FASTAPI_BASE_URL}`
+    - GPT Model: `{GPT_MODEL}`
+    - Multiplier: `{MULTIPLIER}`
+    - Skip Max Attempts: `{SKIP_MAX_ATTEMPTS}`
+    - Clauses Present: `{CLAUSES_PRESENT}`
+
+    **Directories:**
+    - Input Directory: `{INPUT_DIR}`
+    - Output Directory: `{OUTPUT_DIR}`
+    """)
