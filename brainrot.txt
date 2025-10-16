@@ -1,384 +1,108 @@
-# Modified endpoint.py - Add suggestion handling to existing functions
-from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import os
-import sys
-import shutil
-import uuid
-from typing import List
-import pandas as pd
-from bs4 import BeautifulSoup
-import json
+from flask import Flask, send_file, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
+import logging
+import io
 
-# Add your base directory to the path (adjust as needed)
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+app = Flask(__name__)
 
-# Import your existing modules
-from base.constants import (INPUT_DIR, OUTPUT_DIR, GPT_MODEL, MULTIPLIER, SKIP_MAX_ATTEMPTS, CLAUSES_PRESENT)
-from base.llm_helper import LLMHelper
-from base.file_processing import convert_and_extract_text, analyze_document_fonts
-from base.break_documents_into_parts import break_the_document_into_parts, get_nda_sections_list
-from base.get_nda_analysis import get_nda_review_and_amendments
-from base.processing_amendments import process_amendments
-from base.deduplication_of_amendments import (deduplication_of_amendments, deduplicate_amendments_reports, update_sections_list)
-from base.save_to_excel import save_to_excel_with_multiple_sheets
-from base.utils import preprocess_filename, html_to_clean_docx
-from base.rewrite_nda_section import process_nda_sections
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Create FastAPI app
-app = FastAPI(title="Enhanced NDA Processing Application")
 
-# Mount static files (for CSS, JS, etc.)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Setup templates
-templates = Jinja2Templates(directory="templates")
-
-# Ensure directories exist
-os.makedirs(INPUT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs("static", exist_ok=True)
-os.makedirs("templates", exist_ok=True)
-
-# In-memory storage for processing status (in production, use Redis or database)
-processing_status = {}
-
-# ADDED: Storage for AI suggestions (keeping existing pattern)
-ai_suggestions_storage = {}
-
-# ADDED: Helper function to extract suggestions from existing processing results
-def extract_suggestions_from_amendments(amendments_data, task_id):
-    """Extract AI suggestions from your existing amendment processing results"""
-    suggestions = []
+def load_data():
+    """
+    Mock function simulating your load_data()
+    Returns mock data objects
+    """
+    logger.info("Loading data from database/S3...")
     
-    try:
-        # This function adapts your existing amendment data into suggestion format
-        # Modify this based on your actual data structure
-        
-        if isinstance(amendments_data, list):
-            for i, amendment in enumerate(amendments_data):
-                # Extract data from your existing amendment structure
-                suggestion = {
-                    'id': i + 1,
-                    'section': amendment.get('section', f'Section {i+1}'),
-                    'original_text': amendment.get('original_text', amendment.get('original', '')),
-                    'suggested_text': amendment.get('revised_text', amendment.get('suggested', amendment.get('amendment', ''))),
-                    'rationale': amendment.get('rationale', amendment.get('reason', 'AI-generated improvement')),
-                    'confidence': amendment.get('confidence', 0.75)
-                }
-                suggestions.append(suggestion)
-        
-        elif isinstance(amendments_data, dict):
-            for i, (section_key, section_data) in enumerate(amendments_data.items()):
-                if isinstance(section_data, dict):
-                    suggestion = {
-                        'id': i + 1,
-                        'section': section_key,
-                        'original_text': section_data.get('original', ''),
-                        'suggested_text': section_data.get('revised', section_data.get('suggested', '')),
-                        'rationale': section_data.get('rationale', 'AI-generated improvement'),
-                        'confidence': section_data.get('confidence', 0.75)
-                    }
-                    suggestions.append(suggestion)
-        
-        # Store suggestions for this task
-        ai_suggestions_storage[task_id] = suggestions
-        
-    except Exception as e:
-        print(f"Error extracting suggestions: {e}")
-        ai_suggestions_storage[task_id] = []
+    # Simulate data loading
+    matters_data = "mock_matters_data"
+    key_data = "mock_key_data"
+    cumulative_query = "mock_cumulative_query"
     
-    return suggestions
+    return matters_data, key_data, cumulative_query
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    """Serve the main HTML page - UNCHANGED"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Enhanced NDA Processing Application</title>
-    </head>
-    <body>
-        <h1>Enhanced NDA Processing Application</h1>
-        <p>Upload your Policy and NDA documents to generate AI suggestions with selection capability.</p>
-        <h2>Available Endpoints:</h2>
-        <ul>
-            <li><strong>POST /process</strong> - Upload documents and start processing</li>
-            <li><strong>GET /status/{task_id}</strong> - Check processing status and get suggestions</li>
-            <li><strong>POST /process_selections</strong> - Process selected suggestions</li>
-            <li><strong>GET /download/{filename}</strong> - Download generated files</li>
-        </ul>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
 
-# MODIFIED: Your existing background processing function with suggestion extraction
-async def process_documents_background(policy_file_path: str, nda_file_path: str, task_id: str):
+def download_from_s3():
     """
-    MODIFIED version of your existing processing workflow
-    Now extracts AI suggestions from the processing results
+    Mock function simulating S3 download (replaces upload_to_s3)
     """
-    try:
-        # Update status - keep your existing pattern
-        processing_status[task_id]['status'] = 'processing'
-        processing_status[task_id]['progress'] = 10
+    logger.info("Downloading from S3...")
+    import time
+    import random
+    
+    time.sleep(1)  # Simulate processing
+    
+    # Return True for success, False for failure
+    return random.choice([True, True, True, False])  # 75% success rate
+
+
+def generate_csv_file():
+    """
+    Background job to generate CSV periodically
+    """
+    logger.info("Background job: Generating CSV...")
+    
+    # Generate mock CSV data
+    csv_content = "id,name,email,contract_date,value\n"
+    for i in range(1000000):
+        csv_content += f"{i},Contract_{i},user_{i}@example.com,2024-01-01,{i*1000}\n"
+    
+    logger.info("CSV generation complete")
+
+
+@app.route('/download', methods=['GET', 'POST'])
+def execute():
+    logger.info("Process started")
+    
+    # Load data (simulating your load_data call)
+    (matters_data, key_data, cumulative_query) = load_data()
+    
+    # Simulate saving data to CSV (like your to_csv calls)
+    # In reality, these would write to temp files
+    logger.info("Preparing CSV files...")
+    
+    # Simulate the download process
+    result = download_from_s3()
+    
+    logger.info("Process End")
+    
+    if result == True:
+        # Schedule background job
+        scheduler = BackgroundScheduler()
+        run_time = datetime.now() + timedelta(minutes=1)
         
-        # Initialize LLM helper - your existing code
-        llm_helper = LLMHelper()
-        
-        # Convert and extract text from documents - your existing code
-        processing_status[task_id]['progress'] = 20
-        policy_text = convert_and_extract_text(policy_file_path)
-        nda_text = convert_and_extract_text(nda_file_path)
-        
-        # Break documents into parts - your existing code
-        processing_status[task_id]['progress'] = 30
-        policy_sections = break_the_document_into_parts(policy_text, "policy")
-        nda_sections_list = get_nda_sections_list(nda_text)
-        
-        # Get NDA analysis and amendments - your existing code
-        processing_status[task_id]['progress'] = 50
-        amendments_data = get_nda_review_and_amendments(
-            policy_sections, nda_sections_list, llm_helper
+        scheduler.add_job(
+            generate_csv_file, 
+            'interval', 
+            minutes=15,
+            id='second_job', 
+            next_run_time=run_time
         )
         
-        # Process amendments - your existing code
-        processing_status[task_id]['progress'] = 60
-        processed_amendments = process_amendments(amendments_data)
+        scheduler.start()
         
-        # ADDED: Extract suggestions from your existing processing results
-        processing_status[task_id]['progress'] = 65
-        suggestions = extract_suggestions_from_amendments(processed_amendments, task_id)
+        # Generate and return CSV
+        csv_data = io.StringIO()
+        csv_data.write("id,name,email,contract_date,value\n")
+        for i in range(100000):  # Smaller for quick response
+            csv_data.write(f"{i},Contract_{i},user_{i}@example.com,2024-01-01,{i*1000}\n")
         
-        # Continue with your existing deduplication
-        processing_status[task_id]['progress'] = 70
-        deduplicated_amendments = deduplication_of_amendments(processed_amendments)
+        # Convert to bytes
+        csv_bytes = io.BytesIO(csv_data.getvalue().encode('utf-8'))
+        csv_bytes.seek(0)
         
-        # Generate outputs using your existing functions
-        processing_status[task_id]['progress'] = 80
-        nda_filename = os.path.basename(nda_file_path)
-        preprocessed_filename = preprocess_filename(nda_filename)
-        
-        # Process NDA sections and generate outputs - your existing code
-        processing_status[task_id]['progress'] = 90
-        rewritten_nda_sections_text = process_nda_sections(
-            nda_sections_list, deduplicated_amendments, preprocessed_filename, llm_helper
+        return send_file(
+            csv_bytes,
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name='contracts_download.csv'
         )
-        
-        # Generate and save outputs - your existing code
-        excel_report_path, html_with_revisions, docx_file = generate_outputs(
-            rewritten_nda_sections_text, preprocessed_filename
-        )
-        
-        # Update status to completed - MODIFIED to include suggestions
-        processing_status[task_id]['status'] = 'completed'
-        processing_status[task_id]['progress'] = 100
-        processing_status[task_id]['files'] = {
-            'excel_report': excel_report_path,
-            'html_with_revisions': html_with_revisions,
-            'docx_file': docx_file
-        }
-        processing_status[task_id]['preprocessed_filename'] = preprocessed_filename
-        
-        # Clean up uploaded files
-        os.remove(policy_file_path)
-        os.remove(nda_file_path)
-        
-    except Exception as e:
-        processing_status[task_id]['status'] = 'error'
-        processing_status[task_id]['error'] = str(e)
-
-# MODIFIED: Your existing generate_outputs function signature
-def generate_outputs(rewritten_nda_sections_text, preprocessed_filename):
-    """
-    Your existing output generation function - kept as is
-    Returns paths to generated files
-    """
-    # Your existing implementation here...
-    # This is a placeholder - use your actual implementation
-    
-    excel_report_path = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_report.xlsx")
-    html_with_revisions = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.html")
-    docx_file = os.path.join(OUTPUT_DIR, f"{preprocessed_filename}_revised.docx")
-    
-    # Your existing file generation logic here...
-    # save_to_excel_with_multiple_sheets(...) 
-    # html_to_clean_docx(...)
-    # etc.
-    
-    return excel_report_path, html_with_revisions, docx_file
-
-# UNCHANGED: Your existing process endpoint
-@app.post("/process")
-async def process_files(
-    background_tasks: BackgroundTasks,
-    policy_file: UploadFile = File(...),
-    nda_file: UploadFile = File(...)
-):
-    """Process uploaded files - UNCHANGED structure, just updated background task"""
-    
-    # Generate unique task ID
-    task_id = str(uuid.uuid4())
-    
-    # Initialize processing status
-    processing_status[task_id] = {
-        'status': 'started',
-        'progress': 0,
-        'task_id': task_id
-    }
-    
-    try:
-        # Save uploaded files
-        policy_path = os.path.join(INPUT_DIR, f"{task_id}_policy_{policy_file.filename}")
-        nda_path = os.path.join(INPUT_DIR, f"{task_id}_nda_{nda_file.filename}")
-        
-        with open(policy_path, "wb") as buffer:
-            shutil.copyfileobj(policy_file.file, buffer)
-        
-        with open(nda_path, "wb") as buffer:
-            shutil.copyfileobj(nda_file.file, buffer)
-        
-        # Start background processing with your modified function
-        background_tasks.add_task(
-            process_documents_background,
-            policy_path,
-            nda_path,
-            task_id
-        )
-        
-        return {"task_id": task_id, "status": "started"}
-        
-    except Exception as e:
-        processing_status[task_id]['status'] = 'error'
-        processing_status[task_id]['error'] = str(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# MODIFIED: Your existing status endpoint to include suggestions
-@app.get("/status/{task_id}")
-async def get_status(task_id: str):
-    """Get processing status - MODIFIED to include suggestions when complete"""
-    if task_id not in processing_status:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    status_data = processing_status[task_id].copy()
-    
-    # ADDED: Include suggestions in response when processing is complete
-    if status_data['status'] == 'completed' and task_id in ai_suggestions_storage:
-        status_data['suggestions'] = ai_suggestions_storage[task_id]
-    
-    return status_data
-
-# NEW: Endpoint to handle user's checkbox selections
-@app.post("/process_selections")
-async def process_selections(selection_data: dict):
-    """Process user's suggestion selections and generate customized document"""
-    
-    try:
-        task_id = selection_data.get('task_id')
-        selected_suggestion_ids = selection_data.get('selected_suggestion_ids', [])
-        
-        if not task_id:
-            raise HTTPException(status_code=400, detail="task_id is required")
-        
-        if task_id not in processing_status:
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        if processing_status[task_id]['status'] != 'completed':
-            raise HTTPException(status_code=400, detail="Original processing not completed")
-        
-        if task_id not in ai_suggestions_storage:
-            raise HTTPException(status_code=404, detail="No suggestions found for this task")
-        
-        # Get selected suggestions
-        all_suggestions = ai_suggestions_storage[task_id]
-        selected_suggestions = [
-            s for s in all_suggestions 
-            if s['id'] in selected_suggestion_ids
-        ]
-        
-        if not selected_suggestions:
-            raise HTTPException(status_code=400, detail="No valid suggestions selected")
-        
-        # Generate customized files with only selected suggestions
-        preprocessed_filename = processing_status[task_id]['preprocessed_filename']
-        custom_filename = f"{preprocessed_filename}_selected"
-        
-        # Here you would implement selective processing based on selected suggestions
-        # For now, we'll create modified filenames to indicate selective processing
-        selected_excel_path = os.path.join(OUTPUT_DIR, f"{custom_filename}_report.xlsx")
-        selected_html_path = os.path.join(OUTPUT_DIR, f"{custom_filename}_revised.html")
-        selected_docx_path = os.path.join(OUTPUT_DIR, f"{custom_filename}_revised.docx")
-        
-        # TODO: Implement your selective processing logic here
-        # This would involve re-running your document generation with only selected amendments
-        
-        return {
-            'status': 'success',
-            'files': {
-                'excel_report': selected_excel_path,
-                'html_with_revisions': selected_html_path,
-                'docx_file': selected_docx_path
-            },
-            'selected_count': len(selected_suggestions),
-            'total_count': len(all_suggestions)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# UNCHANGED: Your existing download endpoint
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """Download generated files - UNCHANGED"""
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Determine media type based on file extension
-    if filename.endswith('.html'):
-        media_type = 'text/html'
-    elif filename.endswith('.docx'):
-        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif filename.endswith('.xlsx'):
-        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else:
-        media_type = 'application/octet-stream'
-    
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type=media_type
-    )
+        return jsonify({"message": "Failed to download file"}), 500
 
-# OPTIONAL: Cleanup endpoint (new but optional)
-@app.delete("/cleanup/{task_id}")
-async def cleanup_task_data(task_id: str):
-    """Clean up task data and files - OPTIONAL addition"""
-    try:
-        # Remove from memory storage
-        if task_id in processing_status:
-            del processing_status[task_id]
-        
-        if task_id in ai_suggestions_storage:
-            del ai_suggestions_storage[task_id]
-        
-        # Remove associated files
-        for filename in os.listdir(INPUT_DIR):
-            if filename.startswith(task_id):
-                os.remove(os.path.join(INPUT_DIR, filename))
-        
-        return {"status": "cleaned up", "task_id": task_id}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == '__main__':
+    app.run(debug=True, port=5000, threaded=True)
